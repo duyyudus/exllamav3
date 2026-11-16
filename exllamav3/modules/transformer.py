@@ -179,7 +179,12 @@ class TransformerBlock(Module):
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
-            if self.attn.device != self.device:
+            ds_lock = params.get("ds_attn_lock")
+            if ds_lock is not None:
+                # Pipelined prefill over a pinned attention device (PrefillPipeline, EXL3_DS_PIPELINE): this
+                # block's device thread shares the attention device with the threads of other chunks
+                y = ds_lock.run_attn(self, y, params)
+            elif self.attn.device != self.device:
                 # Attention pinned to the split's attention device (Model.load attn_device): its fp16
                 # input and output are what crosses, the residual streams stay here
                 y = self.attn.forward(self.attn.prepare_for_device(y, params), params)

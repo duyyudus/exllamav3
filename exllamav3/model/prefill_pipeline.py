@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+import os
 import queue
 import threading
 import weakref
@@ -8,6 +9,7 @@ from functools import partial
 import torch
 
 from ..cache.recurrent_util import advance_recurrent_states
+from ..util.device_copy import to_device
 
 """
 Prefill across a layer split, with the devices working on different chunks at once.
@@ -30,6 +32,96 @@ served, on one thread. That gives the two properties everything depends on:
 Only prefill goes through here. Model.forward and everything else that uses the devices, or reads what the items
 write, waits for the route to clear first (flush) and then has them to itself.
 """
+
+
+# EXL3_DS_PIPELINE=0 restores the stock rule (no pipeline with CPU-offloaded experts or a pinned attention device)
+_DS = os.environ.get("EXL3_DS_PIPELINE", "1") != "0"
+# Chunks in flight at once in that mode (the stock limit is the number of devices + 1)
+_DS_DEPTH = int(os.environ.get("EXL3_DS_PIPELINE_DEPTH", 2))
+# Chunks shorter than this run serially: decode-class row counts take static workspaces (GTensorCache.get_scratch,
+# the bsz-1 graphs), which chunks in flight on one device would share
+_DS_MIN_ROWS = max(int(os.environ.get("EXL3_DS_PIPELINE_MIN_ROWS", 256)), 64)
+# 0: don't wait for a device to catch up before it reaches into the attention device (see _SharedAttnDevice)
+_DS_PRESYNC = os.environ.get("EXL3_DS_PIPELINE_PRESYNC", "1") != "0"
+
+
+class _SharedAttnDevice:
+    """
+    The extra rules of a pipeline over a split whose attention layers all sit on the first device
+    (caps["attn_device"], DeepSeek-V4.1) and/or whose experts are partly on the CPU worker (moe_cpu_hosts).
+
+    A block on a later device runs its attention on the first device, from its own device's thread, while the
+    first device's thread is working on the next chunk. Whatever is launched on the attention device is launched
+    under one lock: by the first device's thread a module at a time, by the others an attention call at a time
+    including the transfers in and out. (Holding it only for the first device's attention calls was tried: the
+    transients of a remote attention call then overlap those of the first device's MoE, which ran it out of memory.) Launches go to the device's one stream
+    in the order they were made, so a call's kernels run as one block there, as they do in a serial forward.
+
+    What the threads share on that device beyond the stream:
+    - Attention state. A layer's rings and compressor buffers are only touched by that layer's own calls, which
+      all come from the one thread its block belongs to, in chunk order. A pool that later layers read
+      (kv_source_layer_ids) is append-only by position and read below the reader's own position, so a chunk
+      behind the reader appending to it doesn't change what the reader sees; index selections and candidate
+      blocks travel in the chunk's own params (dsv4_shared).
+    - Static workspaces. Calls of more than GTensorCache.SCRATCH_STATIC_ROWS rows allocate theirs, apart from
+      the attention's dsv4_stage, which is written and read inside one call. Shorter chunks don't come here.
+
+    Before reaching into the attention device a thread waits for its own device to catch up: the copy in is
+    ordered behind that device's work, and the attention device would otherwise sit waiting for it with the next
+    chunk's work queued behind (one stream, first come, first served).
+    """
+
+    def __init__(self, hosts: list, first: torch.device):
+        self.lock = threading.RLock()
+        self.hosts = hosts
+        self.first = first
+        self.presync = _DS_PRESYNC
+        self.min_rows = _DS_MIN_ROWS
+        # Set to run every chunk serially (A/B tests)
+        self.force_serial = False
+        self.stats = {"pipelined": 0, "serial": 0, "settle": 0}
+
+    def run_attn(self, block, y: torch.Tensor, params: dict) -> torch.Tensor:
+        """A TransformerBlock's attention call during a pipelined prefill"""
+        attn = block.attn
+        if attn.device == block.device:
+            # On the first device's thread, which holds the lock for the module, or on a device of its own
+            return attn.forward(y, params)
+        if self.presync:
+            torch.cuda.current_stream(block.device).synchronize()
+        with self.lock:
+            y = attn.forward(attn.prepare_for_device(y, params), params)
+            return to_device(y, block.device)
+
+    def unsettled(self, model) -> bool:
+        """Expert transfers between the worker and the devices are landing (promote-on-miss): the first MoE
+        layer of the next forward applies them to every layer's placement map at once, which must not happen
+        under a chunk in flight, so the next chunk is only issued once the route is clear"""
+        reg = getattr(model.config.infer_params, "moe_cpu_swap_modules", None)
+        return bool(reg) and any(getattr(m, "_split_pending", None) for m in reg)
+
+    @staticmethod
+    def layer_stages(model, cache, stages: list) -> dict | None:
+        """Stage whose thread runs each recurrent layer of the cache, by layer key, which with a pinned
+        attention device isn't the stage of the device the layer's state is on. None if a layer can't be
+        placed"""
+        layers = {id(m) for m in model.get_recurrent_layers()}
+        out = {}
+        for i, (module, instance, _) in enumerate(model.fwd_modules):
+            stage = next((s for s, (_, a, b) in enumerate(stages) if a <= i < b), None)
+            for m in module:
+                if id(m) in layers:
+                    if stage is None:
+                        return None
+                    out[(m.layer_idx, instance)] = stage
+        if set(out) != set(cache.get_all_recurrent_layers()):
+            return None
+        return out
+
+
+def _ds_pinned(module) -> set:
+    """ids of the modules of a layer that the architecture pins to the attention device, with their children"""
+    return {id(c) for m in module if m.caps.get("attn_device") for c in m}
 
 
 def _worker(tasks: queue.SimpleQueue, local: threading.local):
@@ -60,15 +152,20 @@ class PrefillPipeline:
         target's stages), or None if the split can't run this way.
         """
         modules = getattr(model, "fwd_modules", None)
-        if not modules or model.loaded_tp or getattr(model.config, "moe_cpu_hosts", None):
+        hosts = getattr(model.config, "moe_cpu_hosts", None)
+        if not modules or model.loaded_tp or (hosts and not _DS):
             return None
         stages = []
+        attn_devices = set()
         for i, (module, _, _) in enumerate(modules):
             device = torch.device(module.device)
             if device.type != "cuda":
                 continue
-            # Parts of a layer on another device would run on the wrong device's thread
-            if any(m.device is not None and torch.device(m.device) != device for m in module):
+            # Parts of a layer on another device would run on the wrong device's thread. Attention pinned to the
+            # split's attention device is run there under _SharedAttnDevice's rules, if that is the first device
+            pinned = _ds_pinned(module) if _DS else ()
+            attn_devices |= {torch.device(m.device) for m in module if id(m) in pinned and m.device is not None}
+            if any(m.device is not None and torch.device(m.device) != device for m in module if id(m) not in pinned):
                 return None
             if not stages or stages[-1][0] != device:
                 if any(s[0] == device for s in stages):
@@ -79,6 +176,17 @@ class PrefillPipeline:
         ends = [s[1] for s in stages[1:]] + [len(modules)]
         stages = [(s[0], s[1], e) for s, e in zip(stages, ends)]
         devices = [s[0] for s in stages]
+        ds = bool(hosts) or bool(attn_devices)
+        if ds:
+            if attn_devices and attn_devices != {devices[0]}:
+                return None
+            # The rows a prefetch stages are kept by its module until its forward takes them, so the next chunk's
+            # prefetch has to come after that: on the first device's thread
+            if any(m.caps.get("prefetch_ids") for module, _, _ in modules[stages[0][2]:] for m in module):
+                return None
+            if cache is not None and cache.recurrent_state_cls is not None \
+                    and _SharedAttnDevice.layer_stages(model, cache, stages) is None:
+                return None
 
         if cache is not None and cache.recurrent_state_cls is not None:
             layers = {torch.device(l.device) for l in cache.get_all_recurrent_layers().values()}
@@ -116,6 +224,12 @@ class PrefillPipeline:
         self.issued = False
         # Chunks past this wait in the caller, so that a slow device can't collect the output of the ones before it
         self.max_passes = len(self.route) + 1
+        # Pinned attention device and/or CPU-offloaded experts: see _SharedAttnDevice
+        hosts = list((getattr(model.config, "moe_cpu_hosts", None) or {}).values())
+        self.ds = None
+        if _DS and (hosts or any(_ds_pinned(module) for module, _, _ in model.fwd_modules)):
+            self.ds = _SharedAttnDevice(hosts, self.route[0])
+            self.max_passes = max(min(self.max_passes, _DS_DEPTH), 1)
         self.pending_stashes = set()
         self.failed_stashes = set()
         self.failures = []
@@ -210,12 +324,30 @@ class PrefillPipeline:
         last cache-writing layer, for a drafter that reads the states after the final norm. then(params) runs at
         the draft stage with the params of the finished pass, so with the exported states.
         """
+        model = self.model
+        ds = self.ds
+        if ds is not None:
+            if ds.force_serial or input_ids.shape[-1] < ds.min_rows or input_ids.shape[0] != 1:
+                # The serial path, which waits for the chunks in flight first
+                ds.stats["serial"] += 1
+                if to_output:
+                    model.forward(input_ids = input_ids, params = params)
+                else:
+                    model.prefill(input_ids = input_ids, params = params)
+                if then is not None:
+                    then(params)
+                return
+            if ds.unsettled(model):
+                ds.stats["settle"] += 1
+                self.flush()
+            ds.stats["pipelined"] += 1
+            params["ds_attn_lock"] = ds
+
         with self.cond:
             while self.passes >= self.max_passes:
                 self.cond.wait()
             self.passes += 1
 
-        model = self.model
         # The page table can move on before later devices get to this chunk
         if "block_table" in params:
             params["block_table"] = params["block_table"].clone()
@@ -227,11 +359,22 @@ class PrefillPipeline:
 
         def section(stage: int):
             a, b = self.stages[stage][1], min(self.stages[stage][2], end)
+            if a < b and ds is not None:
+                if stage and ds.presync:
+                    # The copy of x from the previous device is ordered behind what this one still has queued
+                    torch.cuda.current_stream(self.stages[stage][0]).synchronize()
+                if stage == 0:
+                    for i in range(a, b):
+                        with ds.lock:
+                            run["x"] = model.run_section(run["x"], run["params"], i, i + 1, not to_output)
+                    return
             if a < b:
                 run["x"] = model.run_section(run["x"], run["params"], a, b, not to_output)
 
         def first():
             try:
+                for h in (ds.hosts if ds is not None else ()):
+                    h.begin_pass()
                 run["x"] = model.prepare_inputs(input_ids, params)
                 for m in model._get_prefetch_layers:
                     m.prefetch(run["x"], params)
@@ -250,6 +393,11 @@ class PrefillPipeline:
 
         def finish():
             run["x"] = None
+            if ds is not None and self.route[self.draft_stage] == ds.first:
+                # A drafter on the attention device takes the chunk there as one more call
+                with ds.lock:
+                    then(run["params"])
+                return
             then(run["params"])
 
         steps = [first] + [partial(section, s) for s in range(1, n)]
@@ -277,10 +425,19 @@ class PrefillPipeline:
             side = snapshot.stash_header()
             stashed["target"] = side
             by_stage = {}
+            ds_stages = _SharedAttnDevice.layer_stages(self.model, snapshot.cache, self.stages[:self.draft_stage]) \
+                if self.ds is not None else None
             for k, layer in snapshot.cache.get_all_recurrent_layers().items():
-                by_stage.setdefault(self.route.index(torch.device(layer.device)), {})[k] = layer
+                # (a layer on the pinned attention device is left by the thread of the stage its block is in)
+                s = ds_stages[k] if ds_stages is not None else self.route.index(torch.device(layer.device))
+                by_stage.setdefault(s, {})[k] = layer
+            def copy_layers(layers):
+                if self.ds is not None:
+                    with self.ds.lock:
+                        return side.update(snapshot.stash_layers(layers))
+                side.update(snapshot.stash_layers(layers))
             for s, layers in by_stage.items():
-                steps[s] = lambda layers = layers: side.update(snapshot.stash_layers(layers))
+                steps[s] = partial(copy_layers, layers)
         if state.draft is not None:
             steps[self.draft_stage] = lambda: stashed.__setitem__("draft", state.draft.stash())
         item = _Item(steps, owner, False)

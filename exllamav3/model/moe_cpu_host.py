@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import time
+import threading
 import multiprocessing
 from multiprocessing import shared_memory
 import numpy as np
@@ -997,6 +998,10 @@ class MoeCpuHost:
         self.proc = None
         self.conn = None
         self.seq = 0
+        # Pipelined prefill (PrefillPipeline, EXL3_DS_PIPELINE) submits layers from one thread per device: a
+        # layer's jobs are issued and collected under this lock, so that the slot and ring bookkeeping stay in
+        # one order and a slot's next tenant always finds the previous one's collect already enqueued
+        self.pipe_lock = threading.RLock()
         self.next_slot = 0
         self.slot_last_seq = [0] * MOE_MAX_SLOTS
         self.num_slots = TUNING.num_slots
@@ -1937,7 +1942,8 @@ class MoeCpuHost:
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
                 or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
-            return self.submit(layer_idx, y, selected_experts, routing_weights)
+            with self.pipe_lock:
+                return self.submit(layer_idx, y, selected_experts, routing_weights)
 
         with torch.cuda.device(y.device):
             st = self._ensure_stream_state(y.device)
@@ -1958,10 +1964,13 @@ class MoeCpuHost:
                 print(f" -- stream L{layer_idx}: rows {rows}, streamed experts "
                       f"{len(streamed)}/{E}, assignments {n_str}/{sum(counts_h)}")
             if not streamed:
-                return self.submit(layer_idx, y, selected_experts, routing_weights)
-            return self._submit_prefill_streamed(
-                layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
-                counts_h, flat, shifted, neg)
+                with self.pipe_lock:
+                    return self.submit(layer_idx, y, selected_experts, routing_weights)
+            # (the device has just caught up for the counts above, so the one sync in there is short)
+            with self.pipe_lock:
+                return self._submit_prefill_streamed(
+                    layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
+                    counts_h, flat, shifted, neg)
 
     def _stream_fused_t(self, spec, aux, h):
         """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible
