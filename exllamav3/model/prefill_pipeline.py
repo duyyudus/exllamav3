@@ -36,8 +36,11 @@ write, waits for the route to clear first (flush) and then has them to itself.
 
 # EXL3_DS_PIPELINE=0 restores the stock rule (no pipeline with CPU-offloaded experts or a pinned attention device)
 _DS = os.environ.get("EXL3_DS_PIPELINE", "1") != "0"
-# Chunks in flight at once in that mode (the stock limit is the number of devices + 1)
-_DS_DEPTH = int(os.environ.get("EXL3_DS_PIPELINE_DEPTH", 2))
+# Cap on the chunks in flight at once in that mode. 0 (default): the stock limit, the number of devices + 1, so
+# every device can work on a chunk at the same time, except with a pinned attention device, where every chunk in
+# flight also allocates on that one device for each of its layers and _DS_PINNED_DEPTH applies instead
+_DS_DEPTH = int(os.environ.get("EXL3_DS_PIPELINE_DEPTH", 0))
+_DS_PINNED_DEPTH = 2
 # Chunks shorter than this run serially: decode-class row counts take static workspaces (GTensorCache.get_scratch,
 # the bsz-1 graphs), which chunks in flight on one device would share
 _DS_MIN_ROWS = max(int(os.environ.get("EXL3_DS_PIPELINE_MIN_ROWS", 256)), 64)
@@ -227,9 +230,12 @@ class PrefillPipeline:
         # Pinned attention device and/or CPU-offloaded experts: see _SharedAttnDevice
         hosts = list((getattr(model.config, "moe_cpu_hosts", None) or {}).values())
         self.ds = None
-        if _DS and (hosts or any(_ds_pinned(module) for module, _, _ in model.fwd_modules)):
+        pinned = any(_ds_pinned(module) for module, _, _ in model.fwd_modules)
+        if _DS and (hosts or pinned):
             self.ds = _SharedAttnDevice(hosts, self.route[0])
-            self.max_passes = max(min(self.max_passes, _DS_DEPTH), 1)
+            depth = _DS_DEPTH or (_DS_PINNED_DEPTH if pinned else 0)
+            if depth > 0:
+                self.max_passes = max(min(self.max_passes, depth), 1)
         self.pending_stashes = set()
         self.failed_stashes = set()
         self.failures = []

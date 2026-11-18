@@ -1687,6 +1687,33 @@ class MoeCpuHost:
         st = self.sstate.get(key)
         if st is not None:
             return st
+        with self.pipe_lock:
+            if not self.sstate:
+                # Probe every device with streamable layers now, one after another, while nothing is streaming
+                # yet. Probed lazily per device instead, a pipelined prefill measures each link while other
+                # devices stream over shared ones (two USB4 enclosures on one controller read 3.3 instead of
+                # 3.8 GB/s), and the bandwidth-scaled stream_t, so which experts stream and the rounding of the
+                # output, would depend on timing
+                for d in sorted(set(self._streamed_devices()) | {key}):
+                    if d not in self.sstate:
+                        with torch.cuda.device(d):
+                            self._init_stream_state(torch.device("cuda", d))
+            st = self.sstate.get(key)
+            return st if st is not None else self._init_stream_state(device)
+
+    def _streamed_devices(self):
+        """Devices holding layers registered for the streamed-prefill path (their aux tensors live there)"""
+        devs = set()
+        for aux in self.aux.values():
+            t = aux.get("suh_u")
+            if isinstance(t, (list, tuple)):
+                t = t[0] if t else None
+            if isinstance(t, torch.Tensor) and t.device.type == "cuda":
+                devs.add(t.device.index)
+        return devs
+
+    def _init_stream_state(self, device):
+        key = torch.device(device).index or 0
         bufs = self._device_buffers(device)
         st = dict(
             copy_stream = torch.cuda.Stream(device = device),
