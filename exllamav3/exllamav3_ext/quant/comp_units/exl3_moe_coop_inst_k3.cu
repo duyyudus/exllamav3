@@ -2,3 +2,4 @@
 #include "../exl3_moe_coop_kernel.cuh"
 
 EXL3_MOE_COOP_INST_DEF(3)
+EXL3_MOE_COOP_INST_DEF_AB(k3, 3, false)

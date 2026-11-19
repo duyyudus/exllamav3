@@ -543,6 +543,293 @@ __device__ __forceinline__ void gemv_tile
     __syncthreads();
 }
 
+// ---------------------------------------------------------------------------------------------
+// P3b slice ring (variants 3 and 4). The baseline's register prefetch ring is ineffective: ptxas tracks the B
+// prefetch and the A fragment load on one scoreboard and the first MMA of every k-slice waits for it to drain,
+// i.e. for the prefetch issued a few instructions earlier (one DRAM round trip per slice per warp). Instead each
+// warp streams its B words, and the A fragments when A is global, into a warp-private shared-memory ring with
+// cp.async; cp.async.wait_group waits for exactly the slice being decoded, leaving RING_STG - 1 slices in
+// flight. Every width decodes from the ring with plain shared loads (no shuffles, no staging copies).
+// At bsz 1 kernel A's A rows are already in shared memory (sh_A) and are read from there.
+
+constexpr int RING_STG = 4;                       // ring stages per warp (power of two)
+constexpr int RING_AWORDS = ROWS * 8;             // A rows of one k-slice: 16 halves = 8 words per row
+template <int bits, bool HALF> constexpr int ring_bwords() { return ((WNT * (HALF ? 4 * (2 * bits + 1) : 8 * bits)) + 3) & ~3; }
+template <int bits, bool HALF> constexpr int ring_slot_words() { return ring_bwords<bits, HALF>() + RING_AWORDS; }
+template <int bits, bool HALF> __host__ __device__ constexpr int ring_bytes()
+{
+    // The cross-warp reduction buffer aliases the ring (used only after the slice loop)
+    return WK * RING_STG * ring_slot_words<bits, HALF>() * 4 > smem_red_bytes() ? WK * RING_STG * ring_slot_words<bits, HALF>() * 4 : smem_red_bytes();
+}
+template <int bits, bool HALF = false>
+__host__ __device__ constexpr int smem_a_bytes_ring(int Hi) { return Hi * 2 + ring_bytes<bits, HALF>(); }
+template <int bits, bool HALF = false>
+__host__ __device__ constexpr int smem_b_bytes_ring() { return ring_bytes<bits, HALF>() + smem_part_bytes(); }
+
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
+
+__device__ __forceinline__ void ring_cp_async16(uint32_t dst, const void* src, bool pred, uint64_t policy)
+{
+    asm volatile
+    (
+        "{ .reg .pred p; setp.ne.b32 p, %2, 0;\n"
+        "  @p cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %3; }\n"
+        :: "r"(dst), "l"(src), "r"((int) pred), "l"(policy) : "memory"
+    );
+}
+
+__device__ __forceinline__ void ring_cp_async16_nohint(uint32_t dst, const void* src, bool pred)
+{
+    asm volatile
+    (
+        "{ .reg .pred p; setp.ne.b32 p, %2, 0;\n"
+        "  @p cp.async.cg.shared.global [%0], [%1], 16; }\n"
+        :: "r"(dst), "l"(src), "r"((int) pred) : "memory"
+    );
+}
+
+__device__ __forceinline__ void ring_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N> __device__ __forceinline__ void ring_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory"); }
+
+__device__ __forceinline__ uint32_t ring_lds(uint32_t addr)
+{
+    uint32_t v;
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(addr));
+    return v;
+}
+
+// ---------------------------------------------------------------------------------------------
+// P3b variant 3: the cp.async slice ring above, unrolled by RING_STG (compile-time slots, running pointers, fold
+// at a fixed position) and with the MMA operands swapped: the decoded 16x16 weight tile is the A operand of one
+// m16n8k16 (its four registers are exactly the two B fragments f0 / f1 of the baseline), the activation rows are
+// the B operand (n = token rows). One MMA per tile instead of two and no zero-padded A rows. Each output element
+// sees the same products and the same fp16 accumulation sequence, so results stay bit-identical (checked).
+
+__device__ __forceinline__ void mma_wt(const FragB& f0, const FragB& f1, uint32_t xa, uint32_t xb, uint32_t& c01, uint32_t& c23)
+{
+    const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&f0);
+    const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&f1);
+    asm
+    (
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(c01), "+r"(c23)
+        :  "r"(p0[0]), "r"(p1[0]), "r"(p0[1]), "r"(p1[1]),
+           "r"(xa), "r"(xb)
+    );
+}
+
+template <int bits, int cb, bool WIDE, bool HALF, bool ASH, int V>
+__device__ __forceinline__ void gemv_tile_v3
+(
+    const uint32_t* __restrict__ B32,
+    const half2* __restrict__ A2,
+    size_t a_stride2,
+    const int* __restrict__ rows,
+    int nrows,
+    void* __restrict__ C,
+    size_t c_stride,
+    bool c_f32,
+    int k_begin,
+    int k_end,
+    int ntiles,
+    int group,
+    uint32_t* __restrict__ ring
+)
+{
+    constexpr bool REG = HALF ? false : tile_reg<bits>();
+    constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;
+    constexpr int GWORDS = WNT * TWORDS;
+    constexpr int BW = ring_bwords<bits, HALF>();
+    constexpr int SW = ring_slot_words<bits, HALF>();
+    constexpr int WN = tile_wn<WIDE>();
+    constexpr int WKK = tile_wk<WIDE>();
+    constexpr int TCOLS = tile_cols<WIDE>();
+    constexpr int STG = RING_STG;
+    static_assert(FOLD == STG, "fold cadence must equal the unroll so folds land at a fixed position");
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int wn = warp % WN;
+    const int wk = warp / WN;
+
+    const int kslices = k_end - k_begin;
+    const int chunk = CEIL_DIVIDE(kslices, WKK);
+    const int ks0 = k_begin + wk * chunk;
+    const int myn = max(0, min(chunk, k_end - ks0));
+    const size_t slice_stride = (size_t) ntiles * TWORDS;
+
+    const int r0 = lane >> 2;
+    const bool r0_ok = r0 < nrows;
+
+    [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+    if constexpr (REG && bits == 2)
+    {
+        int i1 = lane >> 1;
+        x_src_b = i1;
+        x_src_a = (i1 + 15) & 15;
+    }
+    if constexpr (REG && bits == 3)
+    {
+        int t_offset = lane << 3;
+        int b1 = (t_offset + 257) * 3;
+        int b2 = b1 + 21;
+        int i0 = (b1 - 16) / 32;
+        int i2 = (b2 - 1) / 32;
+        x_s2 = (i2 + 1) * 32 - b2;
+        x_src_a = i0 % 24;
+        x_src_b = i2 % 24;
+    }
+
+    const bool b_cp = lane < GWORDS / 4;
+    const uint32_t* bnext = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + (b_cp ? lane * 4 : 0);
+    const bool a_cp = !ASH && lane < 2 * nrows;
+    const half2* anext = A2 + (a_cp ? (size_t) rows[lane >> 1] * a_stride2 + (lane & 1) * 4 : 0) + (size_t) ks0 * 8;
+    const uint32_t ring_w = smem_u32(ring + warp * STG * SW);
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
+
+    // Copies for slice i (running pointers advance one slice per call) into compile-time slot s
+    int n_issued = 0;
+    auto issue = [&] (int s)
+    {
+        const bool ok = n_issued < myn;
+        ring_cp_async16(ring_w + s * SW * 4 + lane * 16, bnext, ok && b_cp, policy);
+        if constexpr (!ASH) ring_cp_async16_nohint(ring_w + (s * SW + BW) * 4 + lane * 16, anext, ok && a_cp);
+        ring_commit();
+        bnext += slice_stride;
+        if constexpr (!ASH) anext += 8;
+        n_issued++;
+    };
+
+    #pragma unroll
+    for (int d = 0; d < STG - 1; ++d) issue(d);
+
+    // ASH: shared address of this lane's A pair (row r0, k pair lane & 3) at slice ks0; advances 32 bytes per slice
+    [[maybe_unused]] uint32_t a_sh = ASH ? smem_u32(A2) + (uint32_t) (((size_t) (r0_ok ? rows[r0] : 0) * a_stride2 + (size_t) ks0 * 8 + (lane & 3)) * 4) : 0;
+    [[maybe_unused]] const uint32_t a_off = (uint32_t) ((BW + r0 * 8 + (lane & 3)) * 4);
+    const uint32_t lw = lane * 4;
+    [[maybe_unused]] const uint32_t lw1 = ((lane + 31) & 31) * 4;
+
+    uint32_t c01[WNT] = {}, c23[WNT] = {};      // fp16 accumulators: (col l/4, rows 2(l%4), +1), (col l/4 + 8, ...)
+    float acc[WNT][4] = {};
+
+    for (int ib = 0; ib < myn; ib += STG)
+    {
+        #pragma unroll
+        for (int d = 0; d < STG; ++d)
+        {
+            const int i = ib + d;
+            if (i >= myn) break;
+            ring_wait<STG - 2>();
+            __syncwarp();
+            issue((d + STG - 1) % STG);
+
+            const uint32_t slot = ring_w + d * SW * 4;
+            uint32_t xa, xb;
+            if constexpr (ASH)
+            {
+                xa = ring_lds(a_sh);
+                xb = ring_lds(a_sh + 16);
+                a_sh += 32;
+            }
+            else
+            {
+                xa = ring_lds(slot + a_off);
+                xb = ring_lds(slot + a_off + 16);
+            }
+            xa = r0_ok ? xa : 0u;
+            xb = r0_ok ? xb : 0u;
+
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+            {
+                FragB f0, f1;
+                const uint32_t tb = slot + t * TWORDS * 4;
+                if constexpr (!REG)
+                {
+                    const uint32_t* tp = ring + (warp * STG + d) * SW + t * TWORDS;
+                    dq_dispatch<bits, cb, HALF>(tp, lane << 3, f0, f1);
+                }
+                else if constexpr (bits == 4)
+                {
+                    uint32_t aw = ring_lds(tb + lw1);
+                    uint32_t bw = ring_lds(tb + lw);
+                    exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw, f0, f1);
+                }
+                else if constexpr (bits == 2)
+                {
+                    uint32_t awv = ring_lds(tb + x_src_a * 4);
+                    uint32_t bwv = ring_lds(tb + x_src_b * 4);
+                    exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+                }
+                else  // bits == 3
+                {
+                    uint32_t awv = ring_lds(tb + x_src_a * 4);
+                    uint32_t bwv = ring_lds(tb + x_src_b * 4);
+                    exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+                }
+                mma_wt(f0, f1, xa, xb, c01[t], c23[t]);
+            }
+
+            if (d == STG - 1 || i + 1 == myn)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                {
+                    half2 h01 = *reinterpret_cast<half2*>(&c01[t]);
+                    half2 h23 = *reinterpret_cast<half2*>(&c23[t]);
+                    acc[t][0] += __low2float(h01);
+                    acc[t][1] += __high2float(h01);
+                    acc[t][2] += __low2float(h23);
+                    acc[t][3] += __high2float(h23);
+                    c01[t] = 0u;
+                    c23[t] = 0u;
+                }
+            }
+        }
+    }
+
+    ring_wait<0>();
+    __syncthreads();
+    float* sh_red = (float*) ring;
+    {
+        // Lane l holds output columns t * 16 + l / 4 (+ 8) of token rows 2 (l % 4) and 2 (l % 4) + 1
+        const int n0 = 2 * (lane & 3);
+        const int cl = lane >> 2;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+        {
+            const int n = n0 + j;
+            if (n < nrows)
+            {
+                float* red = sh_red + (wk * ROWS + n) * TCOLS + wn * COLS;
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                {
+                    red[t * 16 + cl] = acc[t][j];
+                    red[t * 16 + cl + 8] = acc[t][2 + j];
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int o = threadIdx.x; o < TCOLS * nrows; o += THREADS)
+    {
+        const int r = o / TCOLS;
+        const int c = o % TCOLS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < WKK; ++j)
+            sum += sh_red[(j * ROWS + r) * TCOLS + c];
+        const size_t idx = (size_t) rows[r] * c_stride + group * TCOLS + c;
+        if (c_f32) ((float*) C)[idx] = sum;
+        else       ((half*) C)[idx] = __float2half_rn(sum);
+    }
+    __syncthreads();
+}
+
 // Completion counter: every thread fences its own stores, then one thread arrives. Returns true
 // (block-uniform) for the last arriving block, which may then read the other blocks' results
 // through L2 (load_*_cg)
@@ -673,7 +960,7 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
 // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
 
-template <int bits, int cb, bool WIDE, bool HALF = false>
+template <int bits, int cb, bool WIDE, bool HALF = false, int V = 0>
 __global__ __launch_bounds__(THREADS)
 void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 {
@@ -748,7 +1035,16 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        if constexpr (V == 0)
+            gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        else
+        {
+            uint32_t* ring = smem_dyn + p.Hi / 2;
+            if (p.a_global)
+                gemv_tile_v3<bits, cb, WIDE, HALF, false, V>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, ring);
+            else
+                gemv_tile_v3<bits, cb, WIDE, HALF, true, V>(B32, (const half2*) sh_A, 0, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, ring);
+        }
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -809,7 +1105,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 // token's slots (rotation * svh, down bias, routing weight) in a fixed order, merges the shared
 // expert and stores the trimmed row
 
-template <int bits, int cb, bool WIDE, bool HALF = false>
+template <int bits, int cb, bool WIDE, bool HALF = false, int V = 0>
 __global__ __launch_bounds__(THREADS)
 void exl3_moe_coop_b_kernel(const MoeCoopParams p)
 {
@@ -819,7 +1115,8 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     extern __shared__ uint32_t smem_dyn[];
     float* sh_red = (float*) smem_dyn;
     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
-    float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS : 0));
+    float* sh_part = V == 0 ? (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS : 0))
+                            : (float*) (smem_dyn + ring_bytes<bits, HALF>() / 4);
     __shared__ int sh_flag;
     __shared__ int sh_n_active;
     __shared__ float sh_gate;
@@ -849,8 +1146,12 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     {
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
-        gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+        if constexpr (V == 0)
+            gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+                                      k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+        else
+            gemv_tile_v3<bits, cb, WIDE, HALF, false, V>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+                                                     k_begin, k_end, p.Ho / 16, group, smem_dyn);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -955,6 +1256,348 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
             }
         }
         __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// P3b variant 4: persistent fused kernel. One launch of (SMs x resident blocks) pulls work items from an atomic
+// queue (p.runs[1]): first every gate/up item of kernel A, then every down item of kernel B (both ordered by
+// expert run), so the down items of the first runs fill the tail of the gate/up phase instead of waiting for a
+// second launch. A down item waits until every 128-column chunk of its slots' activation is written: the
+// gate/up epilogue (last arrival of a chunk) adds one more to the chunk's counter after storing it, so the
+// counter reads arrivals + 1. Deadlock-free: all gate/up items are dequeued before any down item, and gate/up
+// items never wait. The block that dequeues the final index (all others have finished) zeroes every counter
+// and the queue for the next call. Per-item arithmetic is variant 3's, so results are identical.
+
+__device__ __forceinline__ int ld_acquire(const int* p)
+{
+    int v;
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ uint64_t global_ns()
+{
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t));
+    return t;
+}
+
+// Down items wait for gate/up items that are already running, so a wait lasts at most one gate/up item. If it
+// ever exceeds this (counters left dirty by something outside this kernel's protocol), fail the launch with a
+// CUDA error instead of hanging the device
+constexpr uint64_t V4_WAIT_LIMIT_NS = 5000000000ull;
+
+template <int bits, int cb, bool WIDE, bool HALF, int V>
+__device__ __forceinline__ void v4_a_item(const MoeCoopParams& p, int item, uint32_t* smem_dyn, int* sh_flag, int* sh_res, int* sh_rows)
+{
+    constexpr int GPC = tile_gpc<WIDE>();
+    constexpr int CPB = tile_cpb<WIDE>();
+    half* sh_A = (half*) smem_dyn;
+    uint32_t* ring = smem_dyn + p.Hi / 2;
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int nproj = p.gated ? 2 : 1;
+    const int ng = p.I / tile_cols<WIDE>();
+
+    const bool is_gate = p.gated && (item % nproj) == 0;
+    const int rem = item / nproj;
+    const int ks = rem % p.ksplit_a;
+    const int rem2 = rem / p.ksplit_a;
+    const int run_idx = rem2 / ng;
+    const int group = rem2 % ng;
+    int nrows = 0;
+    if (!read_run(p, run_idx, sh_rows, nrows, sh_res))
+    {
+        if (!p.a_global && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
+        {
+            const int row = run_idx / p.topk;
+            if (token_active_slots(p, row) == 0)
+                for (int oc = group + warp * ng; oc < p.Ho / 128; oc += ng * WK)
+                    write_empty_row_chunk(p, row, oc, lane);
+        }
+        __syncthreads();
+        return;
+    }
+    const int local = slot_info(p, sh_rows[0]).local;
+    const int kslices_all = p.Hi / 16;
+    const int k_begin = kslices_all * ks / p.ksplit_a;
+    const int k_end = kslices_all * (ks + 1) / p.ksplit_a;
+
+    const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[local];
+    {
+        const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[local];
+        const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
+        void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
+        if (p.a_global)
+        {
+            gemv_tile_v3<bits, cb, WIDE, HALF, false, V>(B32, (const half2*) (is_gate ? p.had_g : p.had_u), (size_t) p.Hi / 2,
+                                                       sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, ring);
+        }
+        else
+        {
+            const SlotInfo si = slot_info(p, sh_rows[0]);
+            for (int c = warp; c < p.Hi / 128; c += WK)
+                rotate_chunk(p, si.row, suh, c, sh_A, lane);
+            __syncthreads();
+            gemv_tile_v3<bits, cb, WIDE, HALF, true, V>(B32, (const half2*) sh_A, 0, sh_rows, nrows, C, p.I, p.gu_f32,
+                                                      k_begin, k_end, p.I / 16, group, ring);
+        }
+    }
+
+    for (int r = 0; r < nrows; ++r)
+    for (int j = 0; j < CPB; ++j)
+    {
+        const int s = sh_rows[r];
+        const int chunk = (group * CPB + j) / GPC;
+        int* cnt = p.ctr_a + (size_t) s * (p.I / 128) + chunk;
+        if (!arrive_last(cnt, GPC * nproj * p.ksplit_a, sh_flag)) continue;
+        if (warp == 0)
+        {
+            const int col = chunk * 128 + lane * 4;
+            const size_t off = (size_t) s * p.I + col;
+            const size_t pstride = (size_t) (p.bsz * p.topk) * p.I;
+            auto load_sum = [&] (const void* buf, float& v0, float& v1, float& v2, float& v3)
+            {
+                v0 = v1 = v2 = v3 = 0.0f;
+                for (int q = 0; q < p.ksplit_a; ++q)
+                {
+                    float t0, t1, t2, t3;
+                    if (p.gu_f32) load_f4_cg(((const float*) buf) + q * pstride + off, t0, t1, t2, t3);
+                    else          load_h4_cg(((const half*) buf) + q * pstride + off, t0, t1, t2, t3);
+                    v0 += t0; v1 += t1; v2 += t2; v3 += t3;
+                }
+            };
+            if (!(p.dbg & 1))
+            {
+                float u0, u1, u2, u3;
+                load_sum(p.gu_u, u0, u1, u2, u3);
+                had128(u0, u1, u2, u3, lane);
+                scale_h4(((const half*) p.u_svh[local]) + col, u0, u1, u2, u3);
+                if (p.u_bias) add_h4(((const half*) p.u_bias[local]) + col, u0, u1, u2, u3);
+
+                float g0 = u0, g1 = u1, g2 = u2, g3 = u3;
+                if (p.gated)
+                {
+                    load_sum(p.gu_g, g0, g1, g2, g3);
+                    had128(g0, g1, g2, g3, lane);
+                    scale_h4(((const half*) p.g_svh[local]) + col, g0, g1, g2, g3);
+                    if (p.g_bias) add_h4(((const half*) p.g_bias[local]) + col, g0, g1, g2, g3);
+                }
+
+                float a0 = act_gate(p.act, p.gated, g0, u0, p.act_limit);
+                float a1 = act_gate(p.act, p.gated, g1, u1, p.act_limit);
+                float a2 = act_gate(p.act, p.gated, g2, u2, p.act_limit);
+                float a3 = act_gate(p.act, p.gated, g3, u3, p.act_limit);
+
+                scale_h4(((const half*) p.d_suh[local]) + col, a0, a1, a2, a3);
+                had128(a0, a1, a2, a3, lane);
+                store_h4(p.act_out + off, a0, a1, a2, a3);
+            }
+            // Publish: the chunk's activation is complete (counter = arrivals + 1)
+            __threadfence();
+            __syncwarp();
+            if (lane == 0) atomicAdd(cnt, 1);
+        }
+        __syncthreads();
+    }
+}
+
+template <int bits, int cb, bool WIDE, bool HALF, int AGPC, int V>
+__device__ __forceinline__ void v4_b_item(const MoeCoopParams& p, int item, uint32_t* smem_dyn, int* sh_flag, int* sh_res, int* sh_rows,
+                                          int* sh_n_active, float* sh_gate)
+{
+    constexpr int GPC = tile_gpc<WIDE>();
+    constexpr int CPB = tile_cpb<WIDE>();
+    uint32_t* ring = smem_dyn;
+    float* sh_part = (float*) (smem_dyn + ring_bytes<bits, HALF>() / 4);
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int ng = p.Ho / tile_cols<WIDE>();
+
+    const int ks = item % p.ksplit_b;
+    const int rem = item / p.ksplit_b;
+    const int run_idx = rem / ng;
+    const int group = rem % ng;
+    int nrows = 0;
+    if (!read_run(p, run_idx, sh_rows, nrows, sh_res)) { __syncthreads(); return; }
+    const int local = slot_info(p, sh_rows[0]).local;
+    const int kslices_all = p.I / 16;
+    const int k_begin = kslices_all * ks / p.ksplit_b;
+    const int k_end = kslices_all * (ks + 1) / p.ksplit_b;
+
+    // Wait for the activation of every slot of the run (all I / 128 chunks published by the gate/up epilogue)
+    {
+        const int nproj = p.gated ? 2 : 1;
+        const int target = AGPC * nproj * p.ksplit_a + 1;
+        const int chunks = p.I / 128;
+        for (int t = threadIdx.x; t < nrows * chunks; t += THREADS)
+        {
+            const int* cnt = p.ctr_a + (size_t) sh_rows[t / chunks] * chunks + (t % chunks);
+            if (ld_acquire(cnt) >= target) continue;
+            const uint64_t t0 = global_ns();
+            while (ld_acquire(cnt) < target)
+            {
+                __nanosleep(100);
+                if (global_ns() - t0 > V4_WAIT_LIMIT_NS) __trap();
+            }
+        }
+        __syncthreads();
+    }
+
+    {
+        const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
+        float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
+        gemv_tile_v3<bits, cb, WIDE, HALF, false, V>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+                                                   k_begin, k_end, p.Ho / 16, group, ring);
+    }
+
+    for (int r = 0; r < nrows; ++r)
+    for (int j = 0; j < CPB; ++j)
+    {
+        const int s = sh_rows[r];
+        const int row = s / p.topk;
+        const int chunk = (group * CPB + j) / GPC;
+        if (threadIdx.x == 0)
+        {
+            int n = 0;
+            for (int k = 0; k < p.topk; ++k)
+                n += slot_info(p, row * p.topk + k).active ? 1 : 0;
+            *sh_n_active = n;
+        }
+        __syncthreads();
+        if (!arrive_last(p.ctr_b + (size_t) row * (p.Ho / 128) + chunk, *sh_n_active * GPC * p.ksplit_b, sh_flag)) continue;
+        if (p.dbg & 2) continue;
+
+        const int col = chunk * 128 + lane * 4;
+        if (p.sh_gate_w)
+        {
+            const half* xr = p.x + (size_t) row * p.x_stride;
+            float dot = 0.0f;
+            for (int i = threadIdx.x * 2; i < p.H; i += THREADS * 2)
+            {
+                half2 xv = *((const half2*) (xr + i));
+                half2 wv = *((const half2*) (p.sh_gate_w + i));
+                dot += __low2float(xv) * __low2float(wv) + __high2float(xv) * __high2float(wv);
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) sh_part[warp] = dot;
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                float tt = 0.0f;
+                for (int w = 0; w < WK; ++w) tt += sh_part[w];
+                *sh_gate = 1.0f / (1.0f + __expf(-tt));
+            }
+            __syncthreads();
+        }
+
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+        for (int k = warp; k < p.topk; k += WK)
+        {
+            const int sk = row * p.topk + k;
+            const SlotInfo sj = slot_info(p, sk);
+            if (!sj.active) continue;
+            float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+            for (int q = 0; q < p.ksplit_b; ++q)
+            {
+                float t0, t1, t2, t3;
+                load_f4_cg(p.d_out + ((size_t) q * (p.bsz * p.topk) + sk) * p.Ho + col, t0, t1, t2, t3);
+                v0 += t0; v1 += t1; v2 += t2; v3 += t3;
+            }
+            had128(v0, v1, v2, v3, lane);
+            scale_h4(((const half*) p.d_svh[sj.local]) + col, v0, v1, v2, v3);
+            if (p.d_bias) add_h4(((const half*) p.d_bias[sj.local]) + col, v0, v1, v2, v3);
+            o0 += sj.w * v0;
+            o1 += sj.w * v1;
+            o2 += sj.w * v2;
+            o3 += sj.w * v3;
+        }
+        float* part = sh_part + warp * 128 + lane * 4;
+        part[0] = o0; part[1] = o1; part[2] = o2; part[3] = o3;
+        __syncthreads();
+        if (warp == 0)
+        {
+            o0 = 0.0f; o1 = 0.0f; o2 = 0.0f; o3 = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < WK; ++w)
+            {
+                const float* q = sh_part + w * 128 + lane * 4;
+                o0 += q[0]; o1 += q[1]; o2 += q[2]; o3 += q[3];
+            }
+            if (p.sh_out)
+            {
+                const float gv = p.sh_gate_w ? *sh_gate : 1.0f;
+                const float* sh = p.sh_out + (size_t) row * p.H + col;
+                if (col + 0 < p.H) o0 += gv * sh[0];
+                if (col + 1 < p.H) o1 += gv * sh[1];
+                if (col + 2 < p.H) o2 += gv * sh[2];
+                if (col + 3 < p.H) o3 += gv * sh[3];
+            }
+            float* dst = p.out + (size_t) row * p.out_stride + col;
+            if (col + 3 < p.H_out)
+                *((float4*) dst) = make_float4(o0, o1, o2, o3);
+            else
+            {
+                if (col + 0 < p.H_out) dst[0] = o0;
+                if (col + 1 < p.H_out) dst[1] = o1;
+                if (col + 2 < p.H_out) dst[2] = o2;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <int bits, bool HALF>
+__host__ __device__ constexpr int smem_ab_bytes_v4(int Hi)
+{
+    return smem_a_bytes_ring<bits, HALF>(Hi) > smem_b_bytes_ring<bits, HALF>() ? smem_a_bytes_ring<bits, HALF>(Hi) : smem_b_bytes_ring<bits, HALF>();
+}
+
+template <int bits, int cb, bool WIDE_A, bool WIDE_B, bool HALF = false, int V = 4>
+__global__ __launch_bounds__(THREADS, 2)
+void exl3_moe_coop_ab_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    __shared__ int sh_flag;
+    __shared__ int sh_res[4];
+    __shared__ int sh_rows[ROWS];
+    __shared__ int sh_item;
+    __shared__ int sh_n_active;
+    __shared__ float sh_gate;
+
+    const int nproj = p.gated ? 2 : 1;
+    const int n_runs = p.a_global ? p.runs[0] : p.bsz * p.topk;
+    const int na = n_runs * (p.I / tile_cols<WIDE_A>()) * nproj * p.ksplit_a;
+    const int nb = n_runs * (p.Ho / tile_cols<WIDE_B>()) * p.ksplit_b;
+    int* queue = p.runs + 1;
+
+    while (true)
+    {
+        if (threadIdx.x == 0) sh_item = atomicAdd(queue, 1);
+        __syncthreads();
+        const int item = sh_item;
+        __syncthreads();
+        if (item < na)
+            v4_a_item<bits, cb, WIDE_A, HALF, V>(p, item, smem_dyn, &sh_flag, sh_res, sh_rows);
+        else if (item < na + nb)
+            v4_b_item<bits, cb, WIDE_B, HALF, tile_gpc<WIDE_A>(), V>(p, item - na, smem_dyn, &sh_flag, sh_res, sh_rows, &sh_n_active, &sh_gate);
+        else
+        {
+            // The last block to run out of work: every item is complete; reset for the next call
+            if (item == na + nb + (int) gridDim.x - 1)
+            {
+                for (int i = threadIdx.x; i < p.ctr_a_len; i += THREADS) p.ctr_a[i] = 0;
+                for (int i = threadIdx.x; i < p.ctr_b_len; i += THREADS) p.ctr_b[i] = 0;
+                __syncthreads();
+                if (threadIdx.x == 0) *queue = 0;
+            }
+            return;
+        }
     }
 }
 

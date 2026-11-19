@@ -25,7 +25,7 @@ void exl3_moe_coop_empty_kernel(const MoeCoopParams p)
     exl3_moe_coop_ns::write_empty_row_chunk(p, blockIdx.x, blockIdx.y, threadIdx.x);
 }
 
-static MoeCoopKernel moe_coop_kernel_a(float K_, int cb, int Hi, bool wide)
+static MoeCoopKernel moe_coop_kernel_a(float K_, int cb, int Hi, bool wide, int v)
 {
     const BitsK bk = bits_from_K(K_);
     const int K = bk.bits;
@@ -34,25 +34,25 @@ static MoeCoopKernel moe_coop_kernel_a(float K_, int cb, int Hi, bool wide)
         TORCH_CHECK(cb == 2, "exl3_moe_coop: half-integer bitrates require the mul1 codebook");
         switch (K)
         {
-            case 1: return exl3_moe_coop_kernel_a_h1(Hi, wide);
-            case 2: return exl3_moe_coop_kernel_a_h2(Hi, wide);
-            default: return exl3_moe_coop_kernel_a_h3(Hi, wide);
+            case 1: return exl3_moe_coop_kernel_a_h1(Hi, wide, v);
+            case 2: return exl3_moe_coop_kernel_a_h2(Hi, wide, v);
+            default: return exl3_moe_coop_kernel_a_h3(Hi, wide, v);
         }
     }
     switch (K)
     {
-        case 1: return exl3_moe_coop_kernel_a_k1(cb, Hi, wide);
-        case 2: return exl3_moe_coop_kernel_a_k2(cb, Hi, wide);
-        case 3: return exl3_moe_coop_kernel_a_k3(cb, Hi, wide);
-        case 4: return exl3_moe_coop_kernel_a_k4(cb, Hi, wide);
-        case 5: return exl3_moe_coop_kernel_a_k5(cb, Hi, wide);
-        case 6: return exl3_moe_coop_kernel_a_k6(cb, Hi, wide);
-        case 7: return exl3_moe_coop_kernel_a_k7(cb, Hi, wide);
-        default: return exl3_moe_coop_kernel_a_k8(cb, Hi, wide);
+        case 1: return exl3_moe_coop_kernel_a_k1(cb, Hi, wide, v);
+        case 2: return exl3_moe_coop_kernel_a_k2(cb, Hi, wide, v);
+        case 3: return exl3_moe_coop_kernel_a_k3(cb, Hi, wide, v);
+        case 4: return exl3_moe_coop_kernel_a_k4(cb, Hi, wide, v);
+        case 5: return exl3_moe_coop_kernel_a_k5(cb, Hi, wide, v);
+        case 6: return exl3_moe_coop_kernel_a_k6(cb, Hi, wide, v);
+        case 7: return exl3_moe_coop_kernel_a_k7(cb, Hi, wide, v);
+        default: return exl3_moe_coop_kernel_a_k8(cb, Hi, wide, v);
     }
 }
 
-static MoeCoopKernel moe_coop_kernel_b(float K_, int cb, bool wide)
+static MoeCoopKernel moe_coop_kernel_b(float K_, int cb, bool wide, int v)
 {
     const BitsK bk = bits_from_K(K_);
     const int K = bk.bits;
@@ -61,21 +61,51 @@ static MoeCoopKernel moe_coop_kernel_b(float K_, int cb, bool wide)
         TORCH_CHECK(cb == 2, "exl3_moe_coop: half-integer bitrates require the mul1 codebook");
         switch (K)
         {
-            case 1: return exl3_moe_coop_kernel_b_h1(wide);
-            case 2: return exl3_moe_coop_kernel_b_h2(wide);
-            default: return exl3_moe_coop_kernel_b_h3(wide);
+            case 1: return exl3_moe_coop_kernel_b_h1(wide, v);
+            case 2: return exl3_moe_coop_kernel_b_h2(wide, v);
+            default: return exl3_moe_coop_kernel_b_h3(wide, v);
         }
     }
     switch (K)
     {
-        case 1: return exl3_moe_coop_kernel_b_k1(cb, wide);
-        case 2: return exl3_moe_coop_kernel_b_k2(cb, wide);
-        case 3: return exl3_moe_coop_kernel_b_k3(cb, wide);
-        case 4: return exl3_moe_coop_kernel_b_k4(cb, wide);
-        case 5: return exl3_moe_coop_kernel_b_k5(cb, wide);
-        case 6: return exl3_moe_coop_kernel_b_k6(cb, wide);
-        case 7: return exl3_moe_coop_kernel_b_k7(cb, wide);
-        default: return exl3_moe_coop_kernel_b_k8(cb, wide);
+        case 1: return exl3_moe_coop_kernel_b_k1(cb, wide, v);
+        case 2: return exl3_moe_coop_kernel_b_k2(cb, wide, v);
+        case 3: return exl3_moe_coop_kernel_b_k3(cb, wide, v);
+        case 4: return exl3_moe_coop_kernel_b_k4(cb, wide, v);
+        case 5: return exl3_moe_coop_kernel_b_k5(cb, wide, v);
+        case 6: return exl3_moe_coop_kernel_b_k6(cb, wide, v);
+        case 7: return exl3_moe_coop_kernel_b_k7(cb, wide, v);
+        default: return exl3_moe_coop_kernel_b_k8(cb, wide, v);
+    }
+}
+
+// P3b variant 4: whether the last launch on a counter scratch was the fused kernel (scratch shared by all layers
+// of a device; host-side, launches are stream-ordered)
+static std::map<int*, int> moe_coop_fused_state;
+
+// P3b variant 4: fused persistent kernel for the rate, or {nullptr, 0}
+static MoeCoopKernel moe_coop_kernel_ab(float K_, int Hi, bool wide_a, bool wide_b, int v)
+{
+    const BitsK bk = bits_from_K(K_);
+    if (bk.half)
+    {
+        switch (bk.bits)
+        {
+            case 1: return exl3_moe_coop_kernel_ab_h1(Hi, wide_a, wide_b, v);
+            case 2: return exl3_moe_coop_kernel_ab_h2(Hi, wide_a, wide_b, v);
+            default: return exl3_moe_coop_kernel_ab_h3(Hi, wide_a, wide_b, v);
+        }
+    }
+    switch (bk.bits)
+    {
+        case 1: return exl3_moe_coop_kernel_ab_k1(Hi, wide_a, wide_b, v);
+        case 2: return exl3_moe_coop_kernel_ab_k2(Hi, wide_a, wide_b, v);
+        case 3: return exl3_moe_coop_kernel_ab_k3(Hi, wide_a, wide_b, v);
+        case 4: return exl3_moe_coop_kernel_ab_k4(Hi, wide_a, wide_b, v);
+        case 5: return exl3_moe_coop_kernel_ab_k5(Hi, wide_a, wide_b, v);
+        case 6: return exl3_moe_coop_kernel_ab_k6(Hi, wide_a, wide_b, v);
+        case 7: return exl3_moe_coop_kernel_ab_k7(Hi, wide_a, wide_b, v);
+        default: return exl3_moe_coop_kernel_ab_k8(Hi, wide_a, wide_b, v);
     }
 }
 
@@ -121,16 +151,37 @@ static bool moe_coop_pick_wide(int kslices, int slots, int device)
     return kslices >= 256 || (kslices >= 128 && slots >= 32);
 }
 
-// Dynamic shared memory above the 48 KB default needs an opt-in per kernel (once per process)
+// Dynamic shared memory above the 48 KB default needs an opt-in per kernel and device (the attribute is set on the
+// current device's instance of the function). The default limit covers static + dynamic shared memory, so opt in
+// with a margin for the kernels' static part
 static void moe_coop_smem_optin(void* kernel, int smem)
 {
-    if (smem <= 48 * 1024) return;
-    static std::map<void*, int> done;
-    auto it = done.find(kernel);
+    if (smem <= 44 * 1024) return;
+    int dev = 0;
+    cuda_check(cudaGetDevice(&dev));
+    static std::map<std::pair<void*, int>, int> done;
+    auto key = std::make_pair(kernel, dev);
+    auto it = done.find(key);
     if (it != done.end() && it->second >= smem) return;
     cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    done[kernel] = smem;
+    done[key] = smem;
 }
+
+// P3b kernel variant: 4 (default) = fused persistent kernel, falling back to variant 3 for layers without a fused
+// form; 3 = slice-ring kernels, two launches; 0 = baseline kernels. All three give bit-identical results.
+// EXL3_MOE_COOP_VARIANT sets the initial value; exl3_moe_coop_set_variant changes it at runtime (read at every
+// launch, so it switches between requests)
+static int moe_coop_variant_ = -1;
+int exl3_moe_coop_get_variant()
+{
+    if (moe_coop_variant_ < 0)
+    {
+        const char* env = std::getenv("EXL3_MOE_COOP_VARIANT");
+        moe_coop_variant_ = env ? atoi(env) : 4;
+    }
+    return moe_coop_variant_;
+}
+void exl3_moe_coop_set_variant(int v) { moe_coop_variant_ = v; }
 
 void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
 {
@@ -151,8 +202,9 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
-    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
-    MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
+    const int variant = exl3_moe_coop_get_variant();
+    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a, variant);
+    MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b, variant);
     moe_coop_smem_optin(ka.kernel, ka.smem);
     moe_coop_smem_optin(kb.kernel, kb.smem);
 
@@ -165,6 +217,45 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     const int grid_b = base_b * p.ksplit_b;
 
     void* args[] = { (void*) &p };
+
+    // P3b variant 4: one persistent launch for both stages (after the rotation pre-kernel at bsz > 1)
+    MoeCoopKernel kab = { nullptr, 0 };
+    if (variant == 4 && cb == 2 && bits_from_K(K_gu).bits == bits_from_K(K_d).bits && bits_from_K(K_gu).half == bits_from_K(K_d).half)
+        kab = moe_coop_kernel_ab(K_gu, p.Hi, wide_a, wide_b, variant);
+    if (kab.kernel)
+    {
+        moe_coop_smem_optin(kab.kernel, kab.smem);
+        // The fused kernel leaves every counter zero; the split kernels leave the down stage's dirty (the next
+        // call's gate/up kernel resets it). Zero the counters and the queue once when switching into the fused form
+        auto it = moe_coop_fused_state.find(p.ctr_a);
+        if (it == moe_coop_fused_state.end() || !it->second)
+        {
+            cuda_check(cudaMemsetAsync(p.ctr_a, 0, (size_t) (p.ctr_a_len + p.ctr_b_len) * sizeof(int), stream));
+            cuda_check(cudaMemsetAsync(p.runs + 1, 0, sizeof(int), stream));
+        }
+        moe_coop_fused_state[p.ctr_a] = 1;
+        static std::map<std::pair<void*, int>, int> occ;
+        auto ok = std::make_pair(kab.kernel, device);
+        if (occ.find(ok) == occ.end())
+        {
+            int nb = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, kab.kernel, MOE_COOP_THREADS, kab.smem));
+            occ[ok] = std::max(nb, 1);
+        }
+        const int items_max = grid_a + grid_b;
+        const int grid_ab = std::min(items_max, occ[ok] * DevCtx::instance().get_num_sms(device));
+        if (p.a_global)
+        {
+            const int rot_items = slots * (p.Hi / 128) * nproj;
+            const int rot_grid = CEIL_DIVIDE(rot_items, MOE_COOP_THREADS / 32);
+            exl3_moe_coop_ns::exl3_moe_coop_rot_kernel<<<rot_grid, MOE_COOP_THREADS, 0, stream>>>(p);
+        }
+        cuda_check(cudaLaunchKernel(kab.kernel, dim3(grid_ab), dim3(MOE_COOP_THREADS), args, kab.smem, stream));
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+    moe_coop_fused_state[p.ctr_a] = 0;
+
     if (p.a_global)
     {
         const int rot_items = slots * (p.Hi / 128) * nproj;

@@ -151,6 +151,10 @@ void exl3_moe_coop
     const c10::optional<at::Tensor>& sh_gate_w
 );
 
+// P3b kernel variant switch (0 = baseline kernels)
+int exl3_moe_coop_get_variant();
+void exl3_moe_coop_set_variant(int v);
+
 // Length of the int32 scratch for a module: completion counters + run table (slots_max =
 // MAX_BSZN * top_k)
 inline int64_t exl3_moe_coop_ctr_len(int64_t slots_max, int64_t bsz_max, int64_t I, int64_t Ho)

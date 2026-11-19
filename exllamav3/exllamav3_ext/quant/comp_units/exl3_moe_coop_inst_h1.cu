@@ -3,3 +3,4 @@
 
 // 1.5 bpw, mul1 codebook
 EXL3_MOE_COOP_INST_DEF_H(1)
+EXL3_MOE_COOP_INST_DEF_AB(h1, 1, true)
