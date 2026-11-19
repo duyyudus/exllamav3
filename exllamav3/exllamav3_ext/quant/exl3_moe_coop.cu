@@ -167,8 +167,10 @@ static void moe_coop_smem_optin(void* kernel, int smem)
     done[key] = smem;
 }
 
-// P3b kernel variant: 4 (default) = fused persistent kernel, falling back to variant 3 for layers without a fused
-// form; 3 = slice-ring kernels, two launches; 0 = baseline kernels. All three give bit-identical results.
+// MoE coop kernel variant: 5 (default) = fused persistent kernel with the leaner slice loop and the dedicated
+// 2.5 bpw decode, falling back to variant 3 for layers without a fused form; 4 = the same fused launch with the
+// plain slice loop, same fallback; 3 = slice-ring kernels, two launches; 0 = baseline kernels. All give
+// bit-identical results.
 // EXL3_MOE_COOP_VARIANT sets the initial value; exl3_moe_coop_set_variant changes it at runtime (read at every
 // launch, so it switches between requests)
 static int moe_coop_variant_ = -1;
@@ -177,7 +179,7 @@ int exl3_moe_coop_get_variant()
     if (moe_coop_variant_ < 0)
     {
         const char* env = std::getenv("EXL3_MOE_COOP_VARIANT");
-        moe_coop_variant_ = env ? atoi(env) : 4;
+        moe_coop_variant_ = env ? atoi(env) : 5;
     }
     return moe_coop_variant_;
 }
@@ -218,9 +220,9 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
 
     void* args[] = { (void*) &p };
 
-    // P3b variant 4: one persistent launch for both stages (after the rotation pre-kernel at bsz > 1)
+    // P3b variant 4 / P3c variant 5: one persistent launch for both stages (after the rotation pre-kernel at bsz > 1)
     MoeCoopKernel kab = { nullptr, 0 };
-    if (variant == 4 && cb == 2 && bits_from_K(K_gu).bits == bits_from_K(K_d).bits && bits_from_K(K_gu).half == bits_from_K(K_d).half)
+    if ((variant == 4 || variant == 5) && cb == 2 && bits_from_K(K_gu).bits == bits_from_K(K_d).bits && bits_from_K(K_gu).half == bits_from_K(K_d).half)
         kab = moe_coop_kernel_ab(K_gu, p.Hi, wide_a, wide_b, variant);
     if (kab.kernel)
     {

@@ -22,6 +22,7 @@
 // actual run count exit at once.
 
 #include <cuda_fp16.h>
+#include <type_traits>
 #include "../util.h"
 #include "../util.cuh"
 #include "../compat.cuh"
@@ -830,6 +831,383 @@ __device__ __forceinline__ void gemv_tile_v3
     __syncthreads();
 }
 
+// ---------------------------------------------------------------------------------------------
+// P3c variant 5: variant 4's fused launch with a leaner slice loop (gemv_tile_v5). Same ring as variant 3/4 (four
+// one-slice slots per warp: B words, plus A rows when A is global), and:
+// - Two-slice steps where decode is issue-bound (sm_86 / sm_120): the warp waits, synchronizes and issues copies
+//   once per two slices (one cp.async instruction covers both slices' B words, one more the A rows), at the cost of
+//   a shorter prefetch lead (2 slices instead of 3). On sm_89 one-slice steps with variant 3/4's lead.
+// - The unrolled main loop runs whole 4-slice fold groups with no early exit (the remainder runs after it), so no
+//   per-slice exit / fold branches; A-operand columns past the run are not zeroed (they only feed MMA output
+//   columns that are never stored); lane constants are computed once.
+// - The 2.5 bpw (half-rate) tile gets a dedicated decode: a lane's eight 16-bit windows span 34 bits starting at
+//   bit 20 * lane + 18 (mod 32) <= 30 of a tile word, so they always lie in two adjacent words (word indices mod 20,
+//   two lane-constant addresses), and two funnel shifts give every window with one op at byte offsets 0 / 8 / 16, two
+//   otherwise (2 loads + 14 ops per tile instead of 4 + 16). (Storing each tile with its first words repeated after
+//   the end, to need one address register, made cp.async copy the same 16 bytes twice: 2x shared-store wavefronts,
+//   slower on sm_89.)
+// Decoded weights, MMA products and the fp16 accumulation / fold sequence are those of variants 0 / 3 / 4, so the
+// outputs are bit-identical.
+
+// Slices per ring step: 2 where decode is issue-bound (sm_86, sm_120); 1 on sm_89, which is closer to the DRAM bound
+// and loses more to the shorter prefetch lead than it gains from fewer instructions
+__device__ constexpr int v5_sps()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+    return 1;
+#else
+    return 2;
+#endif
+}
+template <int N> using v5_ic = std::integral_constant<int, N>;
+
+// Window extraction of the 2.5 bpw tile from the two adjacent words (lo = lower word index), s0 = funnel alignment of
+// window 7 (30 - first span bit mod 32), s2 = s0 + 2. Above window 7, window j sits at bit offset 3, 5, 8, 10, 13, 15,
+// 18 (j = 6 .. 0) of hi:lo read as one 64-bit value with lo on top: exactly the windows of dq8_half<2>
+template <int cb>
+__device__ __forceinline__ void v5_dq8_h2(uint32_t lo, uint32_t hi, int s0, int s2, FragB& f0, FragB& f1)
+{
+    const uint32_t r0 = __funnelshift_r(hi, lo, s0);
+    const uint32_t r2 = __funnelshift_r(hi, lo, s2);
+    const uint32_t w7 = r0 & 0xffff;
+    const uint32_t w6 = (r0 >> 3) & 0xffff;
+    const uint32_t w5 = (r0 >> 5) & 0xffff;
+    const uint32_t w4 = __byte_perm(r0, 0, 0x4421);
+    const uint32_t w3 = __byte_perm(r2, 0, 0x4421);
+    const uint32_t w2 = (r2 >> 11) & 0xffff;
+    const uint32_t w1 = (r2 >> 13) & 0xffff;
+    const uint32_t w0 = r2 >> 16;
+    exl3_gemv_ns::decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+}
+
+template <int bits, int cb, bool WIDE, bool HALF, bool ASH>
+__device__ __forceinline__ void gemv_tile_v5
+(
+    const uint32_t* __restrict__ B32,
+    const half2* __restrict__ A2,
+    size_t a_stride2,
+    const int* __restrict__ rows,
+    int nrows,
+    void* __restrict__ C,
+    size_t c_stride,
+    bool c_f32,
+    int k_begin,
+    int k_end,
+    int ntiles,
+    int group,
+    uint32_t* __restrict__ ring
+)
+{
+    constexpr bool H2 = HALF && bits == 2;
+    constexpr bool REG = !HALF && (bits == 2 || bits == 3 || bits == 4);
+    constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;    // words per tile
+    constexpr int GWORDS = WNT * TWORDS;
+    constexpr int TW = TWORDS;
+    constexpr int BW = ring_bwords<bits, HALF>();
+    constexpr int SW = ring_slot_words<bits, HALF>();
+    constexpr int SPS = v5_sps();                                    // slices per step
+    constexpr int CHS = BW / 4;                                      // 16-byte ring chunks per slice
+    constexpr int NCP = CEIL_DIVIDE(SPS * CHS, 32);                  // B copy instructions per step
+    constexpr int WN = tile_wn<WIDE>();
+    constexpr int WKK = tile_wk<WIDE>();
+    constexpr int TCOLS = tile_cols<WIDE>();
+    static_assert(RING_STG == 4 && FOLD == 4, "v5 runs one- or two-slice steps over a four-slot ring and folds every four slices");
+    static_assert(BW == GWORDS, "the B words of a slice fill whole 16-byte chunks");
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int wn = warp % WN;
+    const int wk = warp / WN;
+
+    const int kslices = k_end - k_begin;
+    const int chunk = CEIL_DIVIDE(kslices, WKK);
+    const int ks0 = k_begin + wk * chunk;
+    const int myn = max(0, min(chunk, k_end - ks0));
+    const size_t slice_stride = (size_t) ntiles * TWORDS;
+
+    const int r0 = lane >> 2;
+    const bool r0_ok = r0 < nrows;
+
+    // Decode lane constants: ring byte offsets of the lane's two words, funnel alignments
+    [[maybe_unused]] uint32_t dqa = 0, dqb = 0;
+    [[maybe_unused]] int dqs0 = 0, dqs2 = 0;
+    if constexpr (H2)
+    {
+        const int sbit = 20 * lane + 626;               // first bit of the lane's window span (+ one tile, for the wrap)
+        dqa = (uint32_t) (((sbit >> 5) % 20) * 4);
+        dqb = (uint32_t) ((((sbit >> 5) + 1) % 20) * 4);
+        dqs0 = 30 - (sbit & 31);
+        dqs2 = dqs0 + 2;
+    }
+    else if constexpr (REG && bits == 2)
+    {
+        const int i1 = lane >> 1;
+        dqb = (uint32_t) (i1 * 4);
+        dqa = (uint32_t) (((i1 + 15) & 15) * 4);
+    }
+    else if constexpr (REG && bits == 3)
+    {
+        const int b1 = ((lane << 3) + 257) * 3;
+        const int b2 = b1 + 21;
+        const int i0 = (b1 - 16) / 32;
+        const int i2 = (b2 - 1) / 32;
+        dqs0 = (i2 + 1) * 32 - b2;
+        dqa = (uint32_t) ((i0 % 24) * 4);
+        dqb = (uint32_t) ((i2 % 24) * 4);
+    }
+    else if constexpr (REG && bits == 4)
+    {
+        dqb = (uint32_t) (lane * 4);
+        dqa = (uint32_t) (((lane + 31) & 31) * 4);
+    }
+
+    // Copy lane constants. A step copies SPS slices into SPS adjacent slots: B chunk g = c * 32 + lane covers ring
+    // chunk g % CHS of slice g / CHS; A (global) lane covers
+    // 16 bytes of row ((lane & 15) >> 1) of slice lane >> 4. A copy is issued while slice n_issued + its slice < myn
+    const uint32_t* bsrc[NCP];
+    uint32_t bdst[NCP];
+    int blim[NCP];
+    {
+        const uint32_t* bbase = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS;
+        #pragma unroll
+        for (int c = 0; c < NCP; ++c)
+        {
+            const int g = c * 32 + lane;
+            const bool ok = g < SPS * CHS;
+            const int sl = ok ? g / CHS : 0;
+            const int dc = ok ? g % CHS : 0;
+            bsrc[c] = bbase + sl * slice_stride + dc * 4;
+            bdst[c] = (uint32_t) ((sl * SW + dc * 4) * 4);
+            blim[c] = ok ? myn - sl : 0;
+        }
+    }
+    [[maybe_unused]] const half2* asrc = nullptr;
+    [[maybe_unused]] uint32_t adst = 0;
+    [[maybe_unused]] int alim = 0;
+    if constexpr (!ASH)
+    {
+        const int sl = lane >> 4;
+        const int r = (lane & 15) >> 1;
+        const int hf = lane & 1;
+        const bool ok = r < nrows && sl < SPS;
+        asrc = A2 + (ok ? (size_t) rows[r] * a_stride2 : 0) + hf * 4 + (size_t) (ks0 + sl) * 8;
+        adst = (uint32_t) ((sl * SW + BW + r * 8 + hf * 4) * 4);
+        alim = ok ? myn - sl : 0;
+    }
+    const uint32_t ring_w = smem_u32(ring + warp * RING_STG * SW);
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
+
+    int n_issued = 0;
+    auto issue = [&] (auto qc)          // slices n_issued .. n_issued + SPS - 1 into slots Q * SPS ..
+    {
+        constexpr int Q = decltype(qc)::value;
+        #pragma unroll
+        for (int c = 0; c < NCP; ++c)
+        {
+            ring_cp_async16(ring_w + Q * SPS * SW * 4 + bdst[c], bsrc[c], n_issued < blim[c], policy);
+            bsrc[c] += SPS * slice_stride;
+        }
+        if constexpr (!ASH)
+        {
+            ring_cp_async16_nohint(ring_w + Q * SPS * SW * 4 + adst, asrc, n_issued < alim);
+            asrc += SPS * 8;
+        }
+        ring_commit();
+        n_issued += SPS;
+    };
+
+    // ASH: shared address of this lane's A pair (row r0, k pair lane & 3) at the 4-slice group's first slice
+    [[maybe_unused]] uint32_t a_sh = ASH ? smem_u32(A2) + (uint32_t) (((size_t) (r0_ok ? rows[r0] : 0) * a_stride2 + (size_t) ks0 * 8 + (lane & 3)) * 4) : 0;
+    [[maybe_unused]] const uint32_t a_off = (uint32_t) ((BW + r0 * 8 + (lane & 3)) * 4);
+    [[maybe_unused]] const uint32_t ring_wa = ring_w + dqa;
+    [[maybe_unused]] const uint32_t ring_wb = ring_w + dqb;
+
+    uint32_t c01[WNT] = {}, c23[WNT] = {};      // fp16 accumulators: (col l/4, rows 2(l%4), +1), (col l/4 + 8, ...)
+    float acc[WNT][4] = {};
+
+    auto slice = [&] (auto sc)                  // decode ring slot S = the 4-slice group's slice S
+    {
+        constexpr int S = decltype(sc)::value;
+        const uint32_t slot_off = S * SW * 4;
+        uint32_t xa, xb;
+        if constexpr (ASH)
+        {
+            xa = ring_lds(a_sh + S * 32);
+            xb = ring_lds(a_sh + S * 32 + 16);
+        }
+        else
+        {
+            xa = ring_lds(ring_w + slot_off + a_off);
+            xb = ring_lds(ring_w + slot_off + a_off + 16);
+        }
+        #pragma unroll
+        for (int t = 0; t < WNT; ++t)
+        {
+            FragB f0, f1;
+            const uint32_t to = slot_off + t * TW * 4;
+            if constexpr (H2)
+            {
+                const uint32_t lo = ring_lds(ring_wa + to);
+                const uint32_t hi = ring_lds(ring_wb + to);
+                v5_dq8_h2<cb>(lo, hi, dqs0, dqs2, f0, f1);
+            }
+            else if constexpr (REG && bits == 4)
+            {
+                const uint32_t aw = ring_lds(ring_wa + to);
+                const uint32_t bw = ring_lds(ring_wb + to);
+                exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw, f0, f1);
+            }
+            else if constexpr (REG && bits == 2)
+            {
+                const uint32_t awv = ring_lds(ring_wa + to);
+                const uint32_t bwv = ring_lds(ring_wb + to);
+                exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+            }
+            else if constexpr (REG && bits == 3)
+            {
+                const uint32_t awv = ring_lds(ring_wa + to);
+                const uint32_t bwv = ring_lds(ring_wb + to);
+                exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, dqs0, f0, f1);
+            }
+            else
+            {
+                const uint32_t* tp = ring + (warp * RING_STG + S) * SW + t * TW;
+                dq_dispatch<bits, cb, HALF>(tp, lane << 3, f0, f1);
+            }
+            mma_wt(f0, f1, xa, xb, c01[t], c23[t]);
+        }
+    };
+
+    auto fold = [&] ()
+    {
+        #pragma unroll
+        for (int t = 0; t < WNT; ++t)
+        {
+            half2 h01 = *reinterpret_cast<half2*>(&c01[t]);
+            half2 h23 = *reinterpret_cast<half2*>(&c23[t]);
+            acc[t][0] += __low2float(h01);
+            acc[t][1] += __high2float(h01);
+            acc[t][2] += __low2float(h23);
+            acc[t][3] += __high2float(h23);
+            c01[t] = 0u;
+            c23[t] = 0u;
+        }
+    };
+
+    // One step P of a 4-slice group: wait for its slots (issued 4 / SPS - 1 steps earlier), make every lane's copies
+    // visible and the slots decoded in the previous step free, refill those with the slices 4 - SPS ahead, decode NV
+    // slices
+    auto step = [&] (auto pc, auto nc)
+    {
+        constexpr int P = decltype(pc)::value;
+        constexpr int NV = decltype(nc)::value;
+        constexpr int NQ = 4 / SPS;
+        ring_wait<NQ - 2>();
+        __syncwarp();
+        issue(v5_ic<(P + NQ - 1) % NQ>());
+        slice(v5_ic<P * SPS>());
+        if constexpr (NV == 2) slice(v5_ic<P * SPS + 1>());
+    };
+
+    issue(v5_ic<0>());
+    if constexpr (SPS == 1) { issue(v5_ic<1>()); issue(v5_ic<2>()); }
+    const int nmain = myn & ~3;
+    for (int ib = 0; ib < nmain; ib += 4)
+    {
+        if constexpr (SPS == 2)
+        {
+            step(v5_ic<0>(), v5_ic<2>());
+            step(v5_ic<1>(), v5_ic<2>());
+        }
+        else
+        {
+            step(v5_ic<0>(), v5_ic<1>());
+            step(v5_ic<1>(), v5_ic<1>());
+            step(v5_ic<2>(), v5_ic<1>());
+            step(v5_ic<3>(), v5_ic<1>());
+        }
+        fold();
+        if constexpr (ASH) a_sh += 128;
+    }
+    // Remainder (1..3 slices), folded once after the last slice like variants 0 / 3 / 4
+    const int rem = myn - nmain;
+    if (rem)
+    {
+        if constexpr (SPS == 2)
+        {
+            if (rem == 1) step(v5_ic<0>(), v5_ic<1>());
+            else
+            {
+                step(v5_ic<0>(), v5_ic<2>());
+                if (rem == 3) step(v5_ic<1>(), v5_ic<1>());
+            }
+        }
+        else
+        {
+            step(v5_ic<0>(), v5_ic<1>());
+            if (rem > 1) step(v5_ic<1>(), v5_ic<1>());
+            if (rem > 2) step(v5_ic<2>(), v5_ic<1>());
+        }
+        fold();
+    }
+
+    ring_wait<0>();
+    __syncthreads();
+    float* sh_red = (float*) ring;
+    {
+        // Lane l holds output columns t * 16 + l / 4 (+ 8) of token rows 2 (l % 4) and 2 (l % 4) + 1
+        const int n0 = 2 * (lane & 3);
+        const int cl = lane >> 2;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+        {
+            const int n = n0 + j;
+            if (n < nrows)
+            {
+                float* red = sh_red + (wk * ROWS + n) * TCOLS + wn * COLS;
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                {
+                    red[t * 16 + cl] = acc[t][j];
+                    red[t * 16 + cl + 8] = acc[t][2 + j];
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int o = threadIdx.x; o < TCOLS * nrows; o += THREADS)
+    {
+        const int r = o / TCOLS;
+        const int c = o % TCOLS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < WKK; ++j)
+            sum += sh_red[(j * ROWS + r) * TCOLS + c];
+        const size_t idx = (size_t) rows[r] * c_stride + group * TCOLS + c;
+        if (c_f32) ((float*) C)[idx] = sum;
+        else       ((half*) C)[idx] = __float2half_rn(sum);
+    }
+    __syncthreads();
+}
+
+// Ring tile of variant V: gemv_tile_v5 for variant 5 at up to 4 bpw and 2.5 bpw, else gemv_tile_v3. (At 5-8 bpw and
+// 1.5 / 3.5 bpw the v5 loop measured within noise of v3's and spilled registers in the slice loop on sm_120.)
+template <int bits, bool HALF> constexpr bool v5_tile() { return HALF ? bits == 2 : bits <= 4; }
+template <int bits, int cb, bool WIDE, bool HALF, bool ASH, int V>
+__device__ __forceinline__ void gemv_tile_ring
+(
+    const uint32_t* __restrict__ B32, const half2* __restrict__ A2, size_t a_stride2, const int* __restrict__ rows, int nrows,
+    void* __restrict__ C, size_t c_stride, bool c_f32, int k_begin, int k_end, int ntiles, int group, uint32_t* __restrict__ ring
+)
+{
+    if constexpr (V == 5 && v5_tile<bits, HALF>())
+        gemv_tile_v5<bits, cb, WIDE, HALF, ASH>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, ring);
+    else
+        gemv_tile_v3<bits, cb, WIDE, HALF, ASH, V>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, k_begin, k_end, ntiles, group, ring);
+}
+
 // Completion counter: every thread fences its own stores, then one thread arrives. Returns true
 // (block-uniform) for the last arriving block, which may then read the other blocks' results
 // through L2 (load_*_cg)
@@ -1332,7 +1710,7 @@ __device__ __forceinline__ void v4_a_item(const MoeCoopParams& p, int item, uint
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
         if (p.a_global)
         {
-            gemv_tile_v3<bits, cb, WIDE, HALF, false, V>(B32, (const half2*) (is_gate ? p.had_g : p.had_u), (size_t) p.Hi / 2,
+            gemv_tile_ring<bits, cb, WIDE, HALF, false, V>(B32, (const half2*) (is_gate ? p.had_g : p.had_u), (size_t) p.Hi / 2,
                                                        sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, ring);
         }
         else
@@ -1341,7 +1719,7 @@ __device__ __forceinline__ void v4_a_item(const MoeCoopParams& p, int item, uint
             for (int c = warp; c < p.Hi / 128; c += WK)
                 rotate_chunk(p, si.row, suh, c, sh_A, lane);
             __syncthreads();
-            gemv_tile_v3<bits, cb, WIDE, HALF, true, V>(B32, (const half2*) sh_A, 0, sh_rows, nrows, C, p.I, p.gu_f32,
+            gemv_tile_ring<bits, cb, WIDE, HALF, true, V>(B32, (const half2*) sh_A, 0, sh_rows, nrows, C, p.I, p.gu_f32,
                                                       k_begin, k_end, p.I / 16, group, ring);
         }
     }
@@ -1450,7 +1828,7 @@ __device__ __forceinline__ void v4_b_item(const MoeCoopParams& p, int item, uint
     {
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
-        gemv_tile_v3<bits, cb, WIDE, HALF, false, V>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+        gemv_tile_ring<bits, cb, WIDE, HALF, false, V>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
                                                    k_begin, k_end, p.Ho / 16, group, ring);
     }
 

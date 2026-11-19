@@ -11,8 +11,9 @@ struct MoeCoopKernel
     int smem;
 };
 
-// v: P3b kernel variant (0 = baseline, 3 = slice-ring kernels, 4 = fused persistent kernel). Variants 3 and 4 exist
-// for the mul1 codebook only; other codebooks and unknown values use the baseline kernels
+// v: P3b/P3c kernel variant (0 = baseline, 3 = slice-ring kernels, 4 = fused persistent kernel, 5 = fused kernel with
+// the P3c slice loop). Variants 3..5 exist for the mul1 codebook only; other codebooks and unknown values use the
+// baseline kernels
 #define EXL3_MOE_COOP_INST_DECL(K) \
     MoeCoopKernel exl3_moe_coop_kernel_a_k##K(int cb, int Hi, bool wide, int v); \
     MoeCoopKernel exl3_moe_coop_kernel_b_k##K(int cb, bool wide, int v);
@@ -39,8 +40,8 @@ EXL3_MOE_COOP_INST_DECL_H(3)
 
 #undef EXL3_MOE_COOP_INST_DECL_H
 
-// P3b variant 4: persistent fused gate/up + down kernel (mul1, gate/up and down at the same rate); {nullptr, 0}
-// when the variant has no fused form
+// P3b variant 4 / P3c variant 5: persistent fused gate/up + down kernel (mul1, gate/up and down at the same rate);
+// {nullptr, 0} when the variant has no fused form
 #define EXL3_MOE_COOP_INST_DECL_AB(N) MoeCoopKernel exl3_moe_coop_kernel_ab_##N(int Hi, bool wide_a, bool wide_b, int v);
 EXL3_MOE_COOP_INST_DECL_AB(k1)
 EXL3_MOE_COOP_INST_DECL_AB(k2)
@@ -59,20 +60,27 @@ EXL3_MOE_COOP_INST_DECL_AB(h3)
     MoeCoopKernel exl3_moe_coop_kernel_ab_##N(int Hi, bool wide_a, bool wide_b, int v) \
     { \
         using namespace exl3_moe_coop_ns; \
+        const int smem = smem_ab_bytes_v4<K, H>(Hi);    /* variant 5 uses the same ring layout */ \
+        if (v == 5) \
+        { \
+            if (wide_a && wide_b) return { (void*) exl3_moe_coop_ab_kernel<K, 2, true, true, H, 5>, smem }; \
+            if (wide_a) return { (void*) exl3_moe_coop_ab_kernel<K, 2, true, false, H, 5>, smem }; \
+            if (wide_b) return { (void*) exl3_moe_coop_ab_kernel<K, 2, false, true, H, 5>, smem }; \
+            return { (void*) exl3_moe_coop_ab_kernel<K, 2, false, false, H, 5>, smem }; \
+        } \
         if (v != 4) return { nullptr, 0 }; \
-        const int smem = smem_ab_bytes_v4<K, H>(Hi); \
         if (wide_a && wide_b) return { (void*) exl3_moe_coop_ab_kernel<K, 2, true, true, H, 4>, smem }; \
         if (wide_a) return { (void*) exl3_moe_coop_ab_kernel<K, 2, true, false, H, 4>, smem }; \
         if (wide_b) return { (void*) exl3_moe_coop_ab_kernel<K, 2, false, true, H, 4>, smem }; \
         return { (void*) exl3_moe_coop_ab_kernel<K, 2, false, false, H, 4>, smem }; \
     }
 
-// P3b variants: kernel pointer and dynamic shared memory of variant v (mul1 codebook). Variant 4 takes the
+// P3b variants: kernel pointer and dynamic shared memory of variant v (mul1 codebook). Variants 4 and 5 take the
 // split variant 3 kernels for layers without a fused form (gate/up and down at different rates)
 #define EXL3_MOE_COOP_VAR_A(K, H, W) \
-    if (v == 3 || v == 4) return { (void*) exl3_moe_coop_a_kernel<K, 2, W, H, 3>, smem_a_bytes_ring<K, H>(Hi) };
+    if (v == 3 || v == 4 || v == 5) return { (void*) exl3_moe_coop_a_kernel<K, 2, W, H, 3>, smem_a_bytes_ring<K, H>(Hi) };
 #define EXL3_MOE_COOP_VAR_B(K, H, W) \
-    if (v == 3 || v == 4) return { (void*) exl3_moe_coop_b_kernel<K, 2, W, H, 3>, smem_b_bytes_ring<K, H>() };
+    if (v == 3 || v == 4 || v == 5) return { (void*) exl3_moe_coop_b_kernel<K, 2, W, H, 3>, smem_b_bytes_ring<K, H>() };
 
 #define EXL3_MOE_COOP_INST_DEF_H(K) \
     MoeCoopKernel exl3_moe_coop_kernel_a_h##K(int Hi, bool wide, int v) \
