@@ -48,6 +48,87 @@ _DS_MIN_ROWS = max(int(os.environ.get("EXL3_DS_PIPELINE_MIN_ROWS", 256)), 64)
 _DS_PRESYNC = os.environ.get("EXL3_DS_PIPELINE_PRESYNC", "1") != "0"
 
 
+def _fair_lock_on() -> bool:
+    # EXL3_DS_FAIR_LOCK=1: the attention device's lock goes to waiters in arrival order (read per acquisition)
+    return os.environ.get("EXL3_DS_FAIR_LOCK", "0") != "0"
+
+
+def _attn_stage_on() -> bool:
+    # EXL3_DS_ATTN_STAGE=1: remote attention calls move their input and output through pinned host buffers, the
+    # slow hop on the calling device's own stream (read per call)
+    return os.environ.get("EXL3_DS_ATTN_STAGE", "0") != "0"
+
+
+class _FairRLock:
+    """
+    Reentrant lock that can hand itself to waiters in arrival order. threading.RLock lets a thread that releases it
+    take it straight back before the woken waiters run, so the first device's thread, which takes the attention
+    device's lock once per module, ran a chunk's worth of modules back to back while the other devices' attention
+    calls waited (up to about a second each on DeepSeek-V4.1). With EXL3_DS_FAIR_LOCK=1 an acquisition queues
+    behind the ones already waiting; without it, it takes the lock whenever it is free, as threading.RLock does.
+    Mutual exclusion holds in either mode, so the switch can flip at any time.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._owner = None
+        self._depth = 0
+        self._next_ticket = 0
+        self._waiting = []
+
+    def acquire(self):
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner == me:
+                self._depth += 1
+                return True
+            if self._owner is None and not (self._waiting and _fair_lock_on()):
+                self._owner, self._depth = me, 1
+                return True
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self._waiting.append(ticket)
+            while self._owner is not None or (_fair_lock_on() and self._waiting[0] != ticket):
+                self._cond.wait()
+            self._waiting.remove(ticket)
+            self._owner, self._depth = me, 1
+            return True
+
+    def release(self):
+        with self._cond:
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+                self._cond.notify_all()
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+class _AttnStaging:
+    """Pinned host buffers of one device's remote attention calls (its thread is their only user), with the events
+    that say when the attention device's upload has read the input buffer and this device's upload has read the
+    output buffer"""
+
+    def __init__(self):
+        self.bufs = {}
+        self.in_read = None
+        self.out_read = None
+
+    def buf(self, kind: str, like: torch.Tensor) -> torch.Tensor:
+        # One buffer per direction and dtype, grown to the largest call (a full chunk); torch's pinned allocator
+        # keeps a replaced buffer until the copies that use it have run
+        key = (kind, like.dtype)
+        b = self.bufs.get(key)
+        if b is None or b.numel() < like.numel():
+            b = self.bufs[key] = torch.empty(like.numel(), dtype = like.dtype, pin_memory = True)
+        return b[:like.numel()].view(like.shape)
+
+
 class _SharedAttnDevice:
     """
     The extra rules of a pipeline over a split whose attention layers all sit on the first device
@@ -74,8 +155,11 @@ class _SharedAttnDevice:
     chunk's work queued behind (one stream, first come, first served).
     """
 
-    def __init__(self, hosts: list, first: torch.device):
-        self.lock = threading.RLock()
+    def __init__(self, hosts: list, first: torch.device, pinned: bool = False):
+        # Only a pinned attention device has threads competing for the lock; without one (CPU-offloaded experts
+        # alone) the first device's thread is its only user
+        self.lock = _FairRLock() if pinned else threading.RLock()
+        self.staging = {}
         self.hosts = hosts
         self.first = first
         self.presync = _DS_PRESYNC
@@ -92,9 +176,52 @@ class _SharedAttnDevice:
             return attn.forward(y, params)
         if self.presync:
             torch.cuda.current_stream(block.device).synchronize()
+        if _attn_stage_on() and y.device.type == "cuda" and y.is_contiguous():
+            return self._run_attn_staged(attn, block.device, y, params)
         with self.lock:
             y = attn.forward(attn.prepare_for_device(y, params), params)
             return to_device(y, block.device)
+
+    def _run_attn_staged(self, attn, device: torch.device, y: torch.Tensor, params: dict) -> torch.Tensor:
+        """
+        run_attn with the input and output moved through pinned host buffers instead of peer copies. Between GPUs
+        without peer access a peer copy runs on the source device's stream behind a two-way barrier, so returning
+        the output to a device on a slow link held the attention device's one stream for the whole transfer (26 ms
+        for DeepSeek-V4.1's 84 MB on a USB4 card), and every call made it wait for the input to cross as well.
+        Here the slow hops run on the calling device's stream, the send before the lock is taken, and the attention
+        device only does its fast hops. Same bytes, so the same result.
+        """
+        st = self.staging.get(device.index)
+        if st is None:
+            st = self.staging[device.index] = _AttnStaging()
+        own = torch.cuda.current_stream(device)
+        h_in = st.buf("in", y)
+        if st.in_read is not None:
+            st.in_read.synchronize()
+        h_in.copy_(y, non_blocking = True)
+        sent = torch.cuda.Event()
+        sent.record(own)
+        sent.synchronize()
+        with self.lock:
+            dev_stream = torch.cuda.current_stream(attn.device)
+            x = h_in.to(attn.device, non_blocking = True)
+            st.in_read = torch.cuda.Event()
+            st.in_read.record(dev_stream)
+            out = attn.forward(x, params)
+            if not out.is_contiguous():
+                return to_device(out, device)
+            h_out = st.buf("out", out)
+            if st.out_read is not None:
+                dev_stream.wait_event(st.out_read)
+            h_out.copy_(out, non_blocking = True)
+            ready = torch.cuda.Event()
+            ready.record(dev_stream)
+        own.wait_event(ready)
+        r = torch.empty(out.shape, dtype = out.dtype, device = device)
+        r.copy_(h_out, non_blocking = True)
+        st.out_read = torch.cuda.Event()
+        st.out_read.record(own)
+        return r
 
     def unsettled(self, model) -> bool:
         """Expert transfers between the worker and the devices are landing (promote-on-miss): the first MoE
@@ -232,7 +359,7 @@ class PrefillPipeline:
         self.ds = None
         pinned = any(_ds_pinned(module) for module, _, _ in model.fwd_modules)
         if _DS and (hosts or pinned):
-            self.ds = _SharedAttnDevice(hosts, self.route[0])
+            self.ds = _SharedAttnDevice(hosts, self.route[0], pinned)
             depth = _DS_DEPTH or (_DS_PINNED_DEPTH if pinned else 0)
             if depth > 0:
                 self.max_passes = max(min(self.max_passes, depth), 1)

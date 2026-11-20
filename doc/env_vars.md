@@ -978,6 +978,27 @@ random floats there and back, checked on the host) and, if the probe fails, ever
 between that pair bounces through system memory, with a warning printed once. Set to `1`: always
 bounce, no probing. Set to `0`: always copy directly, no probing.
 
+### `EXL3_DS_FAIR_LOCK` (default: `0`)
+
+Pipelined prefill over a pinned attention device (DeepSeek-V4.1 split loads): the lock that every
+device's thread takes to launch work on the attention device is handed to waiters in arrival
+order. Without it, the first device's thread, which takes the lock once per module, can take it
+straight back after each release and run a whole chunk's modules while the other devices'
+attention calls wait (up to about a second each). Read per acquisition. Measured on a 5-GPU split
+with two USB4-attached cards: 13K-token prefill +16%, 64K +9%; together with
+`EXL3_DS_ATTN_STAGE`, +22% and +26%. Output identical.
+
+### `EXL3_DS_ATTN_STAGE` (default: `0`)
+
+Same setting: a later device's attention call moves its input and output through pinned host
+buffers instead of peer copies. Between GPUs without peer access a peer copy runs on the source
+device's stream behind a two-way barrier, so returning an attention output to a device on a slow
+link held the attention device's only stream for the whole transfer (26 ms for 84 MB on a USB4
+card), and the input crossing made it wait as well. Staged, the slow hops run on the calling
+device's own stream (the send before the lock is taken) and the attention device only does its
+fast hops. Same bytes, so the same result. Read per call. Costs two pinned buffers per device
+(about 126 MB for DeepSeek-V4.1 at 4096-token chunks).
+
 ### `EXLLAMA_MASTER_ADDR` (default: `127.0.0.1`), `EXLLAMA_MASTER_PORT` (default: auto)
 
 Rendezvous address and port for the tensor-parallel backend. The port defaults to a free port
