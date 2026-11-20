@@ -168,6 +168,16 @@ class MoeCpuTuning:
         # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
         # on the GPU side
         self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+        # Copy-ahead ring for split layers' streamed prefill: "<cuda index>:<MB>[,...]" reserves
+        # that much VRAM per device for a layer's streamed experts in native order, copied as
+        # soon as the routing is known and computed after the GPU-resident experts (see
+        # submit_prefill_begin). Layers whose streamed experts don't all fit copy what fits ahead
+        # and stream the rest as before. EXL3_MOE_STREAM_AHEAD=0 (read per layer) disables it
+        self.stream_ahead_mb = {}
+        for part in os.environ.get("EXL3_MOE_STREAM_AHEAD_MB", "").split(","):
+            if ":" in part:
+                dev, mb = part.split(":", 1)
+                self.stream_ahead_mb[int(dev)] = int(mb)
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
@@ -1018,6 +1028,9 @@ class MoeCpuHost:
         # the GPU (weights DMA'd through a pinned staging ring) while the tail stays on the CPU
         self.num_wslots = TUNING.num_wslots
         self.wslot_size = TUNING.wslot_size
+        # Copy-ahead ring sizes per device (main model only: an MTP head or draft model on the
+        # same device would carve a second ring for a fraction of the work)
+        self.stream_ahead_mb = TUNING.stream_ahead_mb if comp == "text" else {}
         self.stream_t = TUNING.stream_t
         self.stream_min_rows = TUNING.stream_min_rows
         self.batch_experts = TUNING.batch_experts
@@ -1671,8 +1684,13 @@ class MoeCpuHost:
                 w_scratch = None,
                 fused_bufs = {},
                 recon = {},
+                ahead = None,
             )
             self._dev_bufs[key] = d
+            ahead_mb = self.stream_ahead_mb.get(key, 0)
+            if ahead_mb > 0:
+                d["ahead"] = torch.empty(ahead_mb * 1024 * 1024 // 2, dtype = torch.int16, device = device)
+                print(f" -- CPU MoE stream copy-ahead ring: cuda:{key} {ahead_mb} MB")
         if spec is not None and d["native_slots"] is None and self._stream_layout(spec)[1]:
             d["native_slots"] = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
                                  for _ in range(self.num_wslots)]
@@ -1729,6 +1747,12 @@ class MoeCpuHost:
             fused_bufs = bufs["fused_bufs"],
             # Batched reconstruct tier state per layer (moe_batch_recon.BatchReconLayer)
             recon = bufs["recon"],
+            # Copy-ahead ring (TUNING.stream_ahead_mb): one ready event per batch copied ahead,
+            # and the event after the last ahead batch's compute that the next layer's copies wait on
+            ahead = bufs.get("ahead"),
+            ahead_ev = [],
+            ahead_consumed_ev = torch.cuda.Event(),
+            ahead_used = False,
         )
 
         # Probe pinned->device bandwidth once: the break-even assignment count for streaming an
@@ -1747,7 +1771,7 @@ class MoeCpuHost:
             # streaming keeps the link awake, so the sustained awake rate is the one to use
             bw = probe_bandwidth(timed_copy)
         st["bw"] = bw
-        if st["native_slots"] is not None:
+        if st["native_slots"] is not None or st["ahead"] is not None:
             # The ring was carved on the compute stream during the measured load; the copy
             # stream writes into it, so its first write is ordered after that stream (the
             # allocator may have recycled a block whose last user is still queued there)
@@ -1965,12 +1989,24 @@ class MoeCpuHost:
         after them, so the CPU works the tail while the GPU streams. Falls back to the plain CPU
         path when nothing qualifies.
         """
+        return self.submit_prefill_begin(layer_idx, y, selected_experts, routing_weights, ahead = False)[1]
+
+    def submit_prefill_begin(self, layer_idx, y, selected_experts, routing_weights, ahead = True):
+        """
+        submit_prefill in two halves for a caller with GPU expert work of its own (split
+        layers). Returns ("out", routed partial) when everything ran here, or ("ahead", ctx)
+        when the device has a copy-ahead ring: the streamed experts' copies are already queued
+        on the copy stream, and the caller enqueues its own experts before
+        submit_prefill_finish(ctx) enqueues the streamed compute behind them, so the copies
+        overlap that work instead of gating the compute stream. Same split, batches and
+        accumulation order as the one-shot path, so the output is identical.
+        """
         spec = self.specs[layer_idx]
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
                 or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
             with self.pipe_lock:
-                return self.submit(layer_idx, y, selected_experts, routing_weights)
+                return "out", self.submit(layer_idx, y, selected_experts, routing_weights)
 
         with torch.cuda.device(y.device):
             st = self._ensure_stream_state(y.device)
@@ -1992,12 +2028,123 @@ class MoeCpuHost:
                       f"{len(streamed)}/{E}, assignments {n_str}/{sum(counts_h)}")
             if not streamed:
                 with self.pipe_lock:
-                    return self.submit(layer_idx, y, selected_experts, routing_weights)
+                    return "out", self.submit(layer_idx, y, selected_experts, routing_weights)
+            args = (layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
+                    counts_h, flat, shifted, neg)
+            if ahead and st["ahead"] is not None and os.environ.get("EXL3_MOE_STREAM_AHEAD", "1") != "0":
+                pre = self._stream_ahead(*args)
+                if pre is not None:
+                    return "ahead", args + (pre,)
             # (the device has just caught up for the counts above, so the one sync in there is short)
             with self.pipe_lock:
-                return self._submit_prefill_streamed(
-                    layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
-                    counts_h, flat, shifted, neg)
+                return "out", self._submit_prefill_streamed(*args)
+
+    def submit_prefill_finish(self, ctx):
+        """Second half of submit_prefill_begin's ("ahead", ctx): the CPU tail, the streamed
+        compute and the tail collect, enqueued behind whatever the caller queued in between"""
+        with torch.cuda.device(ctx[1].device), self.pipe_lock:
+            return self._submit_prefill_streamed(*ctx[:-1], pre = ctx[-1])
+
+    def _stream_prep(self, y, flat, shifted, routing_weights, topk, counts_h, neg, streamed, E):
+        """Per-layer assignment lists of the streamed path: the expert-sorted token and weight
+        lists with host-known per-expert offsets, and the CPU tail's rows (one sync, for the
+        tail row count)"""
+        # Group assignments by expert once: every expert's token segment is then a slice at
+        # host-known prefix offsets. Anything per-expert/per-batch from here on is sync-free —
+        # per-expert nonzero() would pin the host to the stream position and collapse the
+        # copy-stream lookahead into lockstep with compute
+        order = torch.argsort(flat)
+        token_sorted = torch.div(order, topk, rounding_mode = "floor")
+        weight_sorted = routing_weights.reshape(-1).index_select(0, order)
+        offs = [neg]
+        for c in counts_h:
+            offs.append(offs[-1] + c)
+        # CPU tail: mask streamed assignments, then compress to rows that still carry work (a
+        # nearly-fully-streamed layer otherwise pays a full cap_rows-chunked pass of no-ops).
+        # The streamed table is built host-side and indexed with the shifted ids (entry 0 is the
+        # -1 sentinel, always False), replacing the index_put/clamp/compare/and kernel chain
+        table = np.zeros(E + 1, dtype = np.bool_)
+        for e in streamed:
+            table[e + 1] = True
+        smask1 = host_to_device(torch.from_numpy(table), y.device)
+        is_streamed = smask1.index_select(0, shifted)
+        sel_tail = flat.masked_fill(is_streamed, -1).view(y.shape[0], topk)
+        tidx = (sel_tail >= 0).any(dim = 1).nonzero(as_tuple = True)[0]
+        return dict(token_sorted = token_sorted, weight_sorted = weight_sorted, offs = offs,
+                    sel_tail = sel_tail, tidx = tidx)
+
+    def _stream_ahead(self, layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
+                      counts_h, flat, shifted, neg):
+        """Queue the copies of a layer's streamed batches into the device's copy-ahead ring
+        (DMA from the pinned arena, restored to native order on the copy stream), as many whole
+        batches as fit, before the caller's GPU expert work. Returns the prepared lists with
+        the ring views, or None when the layer can't use the ring (staged experts, nothing fits)"""
+        exp_b = spec["expert_bytes"]
+        per_slot = min(self.wslot_size // exp_b, self.batch_experts)
+        blocks = self.layer_blocks[layer_idx] if self.pinned else None
+        pinned_chunks = self.arena_registered
+        if blocks is None or not (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in streamed)):
+            return None
+        buf = st["ahead"]
+        cap = buf.numel() * 2
+        batches = [streamed[i0:i0 + per_slot] for i0 in range(0, len(streamed), per_slot)]
+        sizes = []
+        for batch in batches:
+            if sum(sizes) + len(batch) * exp_b > cap:
+                break
+            sizes.append(len(batch) * exp_b)
+        if len(sizes) < len(batches) and not st.get("ahead_short"):
+            st["ahead_short"] = True
+            need = sum(len(b) for b in batches) * exp_b
+            print(f" -- CPU MoE stream copy-ahead ring: cuda:{y.device.index} layer {layer_idx} needs "
+                  f"{need / 2**20:.0f} MB, ring holds {len(sizes)}/{len(batches)} batches")
+        if not sizes:
+            return None
+        pre = self._stream_prep(y, flat, shifted, routing_weights, selected_experts.shape[1],
+                                counts_h, neg, streamed, spec["num_experts"])
+        layout, restore = self._stream_layout(spec)
+        pd = spec["proj_dims"]
+        gb, ub, _ = spec["proj_bytes"]
+        copy_stream = st["copy_stream"]
+        evs = st["ahead_ev"]
+        while len(evs) < len(sizes):
+            evs.append(torch.cuda.Event())
+        views = []
+        off = 0
+        with torch.cuda.stream(copy_stream):
+            # The previous layer's ahead batches must have been computed before the ring is reused
+            if st["ahead_used"]:
+                copy_stream.wait_event(st["ahead_consumed_ev"])
+            for k, nb in enumerate(sizes):
+                batch = batches[k]
+                dst = buf[off // 2 : (off + nb) // 2]
+                # Packed experts land in the small ring's slots (only the restore below reads
+                # them, on this same stream) and are restored into the ahead ring
+                land = dst
+                if restore:
+                    ws = k % self.num_wslots
+                    if st["wslot_used"][ws]:
+                        # (an unpacked layer's one-shot compute reads the slot itself)
+                        copy_stream.wait_event(st["wconsumed_ev"][ws])
+                    land = st["vram_slots"][ws]
+                for bi, e in enumerate(batch):
+                    ci, eo = blocks[e]
+                    land[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
+                        self.arena_views[ci][eo // 2 : (eo + exp_b) // 2], non_blocking = True)
+                if restore:
+                    for pi, (name, po) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
+                        if not pd.get(name):
+                            continue
+                        k_, n_, K = pd[name]
+                        ext.moe_unswizzle_trellis(
+                            land, dst, len(batch), exp_b, po, k_ // 16, n_ // 16, K,
+                            layout[pi][0], layout[pi][1])
+                evs[k].record(copy_stream)
+                views.append(dst)
+                off += nb
+        st["ahead_used"] = True
+        pre["ahead_views"] = views
+        return pre
 
     def _stream_fused_t(self, spec, aux, h):
         """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible
@@ -2071,8 +2218,84 @@ class MoeCpuHost:
         batched = recon.worst_case_bytes(A, slot_mode = False) if recon is not None else 0
         return fixed, max(per_expert, batched)
 
+    def _stream_copy_batch(self, layer_idx, batch, st, spec, device, blocks, pinned_chunks, exp_b,
+                           copy_stream, abort, layout, restore, pd, gb, ub):
+        """Queue one streamed batch's weights into the next slot of the small VRAM ring (pinned
+        DMA or worker-staged, restored to native order when packed) on the copy stream; returns
+        the slot, whose wready_ev marks the bytes landed"""
+        ws = self.next_wslot
+        self.next_wslot = (self.next_wslot + 1) % self.num_wslots
+        self.wseq += 1
+        seq = self.wseq
+
+        if blocks is not None and (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in batch)):
+            # Pinned arena: DMA each expert's contiguous block straight out of the
+            # registered arena mapping on the copy stream (no worker involvement, the
+            # stager thread stays idle)
+            with torch.cuda.stream(copy_stream):
+                if st["wslot_used"][ws]:
+                    copy_stream.wait_event(st["wconsumed_ev"][ws])
+                raw = st["vram_slots"][ws]
+                for bi, e in enumerate(batch):
+                    ci, off = blocks[e]
+                    raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
+                        self.arena_views[ci][off // 2 : (off + exp_b) // 2],
+                        non_blocking = True)
+        else:
+            # Stage job: its own ring, consumed by the worker's dedicated stager thread, so
+            # the weight memcpys overlap the compute pool's work on the tail
+            stail = int(self.v_stage_tail[0])
+            while stail - int(self.v_stage_head[0]) >= MOE_STAGE_RING - 2:
+                import time
+                if self.v_abort[0] or not self.proc.is_alive():
+                    raise RuntimeError("CPU MoE worker failed (stage ring stall)")
+                time.sleep(0.0002)
+            job = self.v_stage_jobs[stail % MOE_STAGE_RING]
+            _set_job_seq(job, seq)
+            job[1] = layer_idx
+            job[2] = len(batch)
+            job[3] = 0
+            job[4] = ws
+            job[5] = 1    # MOE_JOB_KIND_STAGE
+            job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
+            for bi, e in enumerate(batch):
+                job[7 + bi] = e
+            self.v_stage_tail[0] = stail + 1
+            self.wslot_prev_seq[ws] = seq
+
+            used = (len(batch) * exp_b) // 2
+            with torch.cuda.stream(copy_stream):
+                if st["wslot_used"][ws]:
+                    copy_stream.wait_event(st["wconsumed_ev"][ws])
+                ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
+                st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
+                ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
+
+        if restore and st["native_slots"] is None:
+            # First batch on this device that needs native-order bytes: adopt the ring the
+            # measured load allocated, or allocate it now (manual loads) on the compute
+            # stream. The caching allocator ties the block to the stream it was carved on,
+            # so the copy stream's first write into it is ordered after that stream
+            st["native_slots"] = self._device_buffers(device, spec)["native_slots"]
+            copy_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(copy_stream):
+            if restore:
+                # Restore native tile and dword/halfword order on the copy stream, one launch per
+                # projection over the whole batch (group-0 projections in an otherwise
+                # packed layer take the plain-copy path in the same kernel)
+                for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
+                    if not pd.get(name):
+                        continue
+                    k, n, K = pd[name]
+                    ext.moe_unswizzle_trellis(
+                        st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
+                        k // 16, n // 16, K, layout[pi][0], layout[pi][1])
+            st["wready_ev"][ws].record(copy_stream)
+        st["wslot_used"][ws] = True
+        return ws
+
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
-                                 streamed, st, counts_h, flat, shifted, neg):
+                                 streamed, st, counts_h, flat, shifted, neg, pre = None):
         from ..modules.moe_batch_recon import plan_groups
         rows = y.shape[0]
         h = y.shape[1]
@@ -2082,29 +2305,15 @@ class MoeCpuHost:
         out_ext = torch.zeros((rows + 1, h), dtype = torch.float, device = y.device)
         out = out_ext[:rows]
 
-        # Group assignments by expert once: every expert's token segment is then a slice at
-        # host-known prefix offsets. Anything per-expert/per-batch from here on is sync-free —
-        # per-expert nonzero() would pin the host to the stream position and collapse the
-        # copy-stream lookahead into lockstep with compute
-        order = torch.argsort(flat)
-        token_sorted = torch.div(order, topk, rounding_mode = "floor")
-        weight_sorted = routing_weights.reshape(-1).index_select(0, order)
-        offs = [neg]
-        for c in counts_h:
-            offs.append(offs[-1] + c)
+        # Expert-sorted assignment lists and the CPU tail's rows; with a copy-ahead ring
+        # (pre given) prepared before the caller's GPU expert work, along with the copies
+        p = pre if pre is not None else self._stream_prep(
+            y, flat, shifted, routing_weights, topk, counts_h, neg, streamed, E)
+        token_sorted, weight_sorted, offs = p["token_sorted"], p["weight_sorted"], p["offs"]
+        sel_tail, tidx = p["sel_tail"], p["tidx"]
+        n_ahead = len(p["ahead_views"]) if pre is not None else 0
 
-        # CPU tail: mask streamed assignments, then compress to rows that still carry work (a
-        # nearly-fully-streamed layer otherwise pays a full cap_rows-chunked pass of no-ops).
-        # Issue only; the waits and readbacks come after the streamed batches are enqueued.
-        # The streamed table is built host-side and indexed with the shifted ids (entry 0 is the
-        # -1 sentinel, always False), replacing the index_put/clamp/compare/and kernel chain
-        table = np.zeros(E + 1, dtype = np.bool_)
-        for e in streamed:
-            table[e + 1] = True
-        smask1 = host_to_device(torch.from_numpy(table), y.device)
-        is_streamed = smask1.index_select(0, shifted)
-        sel_tail = flat.masked_fill(is_streamed, -1).view(rows, topk)
-        tidx = (sel_tail >= 0).any(dim = 1).nonzero(as_tuple = True)[0]
+        # CPU tail: issue only; the waits and readbacks come after the streamed batches are enqueued
         n_tail = tidx.shape[0]
         tail_jobs = None
         if n_tail:
@@ -2142,81 +2351,20 @@ class MoeCpuHost:
         if fused_t and any(counts_h[e] <= fused_t for e in streamed):
             fbufs = self._stream_fused_bufs(st, spec, y.device)
 
-        for i0 in range(0, len(streamed), per_slot):
+        for k, i0 in enumerate(range(0, len(streamed), per_slot)):
             batch = streamed[i0:i0 + per_slot]
-            ws = self.next_wslot
-            self.next_wslot = (self.next_wslot + 1) % self.num_wslots
-            self.wseq += 1
-            seq = self.wseq
-
-            if blocks is not None and (pinned_chunks is None or all(blocks[e][0] < pinned_chunks for e in batch)):
-                # Pinned arena: DMA each expert's contiguous block straight out of the
-                # registered arena mapping on the copy stream (no worker involvement, the
-                # stager thread stays idle)
-                with torch.cuda.stream(copy_stream):
-                    if st["wslot_used"][ws]:
-                        copy_stream.wait_event(st["wconsumed_ev"][ws])
-                    raw = st["vram_slots"][ws]
-                    for bi, e in enumerate(batch):
-                        ci, off = blocks[e]
-                        raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
-                            self.arena_views[ci][off // 2 : (off + exp_b) // 2],
-                            non_blocking = True)
+            if k < n_ahead:
+                # Copied ahead (submit_prefill_begin): compute straight from the ahead ring
+                ws = None
+                torch.cuda.current_stream().wait_event(st["ahead_ev"][k])
+                vslot = p["ahead_views"][k]
             else:
-                # Stage job: its own ring, consumed by the worker's dedicated stager thread, so
-                # the weight memcpys overlap the compute pool's work on the tail
-                stail = int(self.v_stage_tail[0])
-                while stail - int(self.v_stage_head[0]) >= MOE_STAGE_RING - 2:
-                    import time
-                    if self.v_abort[0] or not self.proc.is_alive():
-                        raise RuntimeError("CPU MoE worker failed (stage ring stall)")
-                    time.sleep(0.0002)
-                job = self.v_stage_jobs[stail % MOE_STAGE_RING]
-                _set_job_seq(job, seq)
-                job[1] = layer_idx
-                job[2] = len(batch)
-                job[3] = 0
-                job[4] = ws
-                job[5] = 1    # MOE_JOB_KIND_STAGE
-                job[6] = self.wslot_prev_seq[ws] & 0xFFFFFFFF   # compared cyclically by the worker
-                for bi, e in enumerate(batch):
-                    job[7 + bi] = e
-                self.v_stage_tail[0] = stail + 1
-                self.wslot_prev_seq[ws] = seq
-
-                used = (len(batch) * exp_b) // 2
-                with torch.cuda.stream(copy_stream):
-                    if st["wslot_used"][ws]:
-                        copy_stream.wait_event(st["wconsumed_ev"][ws])
-                    ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
-                    st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
-                    ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
-
-            if restore and st["native_slots"] is None:
-                # First batch on this device that needs native-order bytes: adopt the ring the
-                # measured load allocated, or allocate it now (manual loads) on the compute
-                # stream. The caching allocator ties the block to the stream it was carved on,
-                # so the copy stream's first write into it is ordered after that stream
-                st["native_slots"] = self._device_buffers(y.device, spec)["native_slots"]
-                copy_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(copy_stream):
-                if restore:
-                    # Restore native tile and dword/halfword order on the copy stream, one launch per
-                    # projection over the whole batch (group-0 projections in an otherwise
-                    # packed layer take the plain-copy path in the same kernel)
-                    for pi, (name, off) in enumerate((("g", 0), ("u", gb), ("d", gb + ub))):
-                        if not pd.get(name):
-                            continue
-                        k, n, K = pd[name]
-                        ext.moe_unswizzle_trellis(
-                            st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
-                            k // 16, n // 16, K, layout[pi][0], layout[pi][1])
-                st["wready_ev"][ws].record(copy_stream)
-            st["wslot_used"][ws] = True
-
-            # Compute the batch on the current stream once the DMA lands
-            torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
-            vslot = st["native_slots"][ws] if restore else st["vram_slots"][ws]
+                ws = self._stream_copy_batch(
+                    layer_idx, batch, st, spec, y.device, blocks, pinned_chunks, exp_b, copy_stream,
+                    abort, layout, restore, pd, gb, ub)
+                # Compute the batch on the current stream once the DMA lands
+                torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
+                vslot = st["native_slots"][ws] if restore else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]
@@ -2348,7 +2496,11 @@ class MoeCpuHost:
                                      aux["bias_d"][e] if aux.get("bias_d") else None,
                                      st["w_scratch"], out_dtype = torch.float)
                 out.index_add_(0, idx, dy[:, :h] * we)
-            st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
+            if ws is not None:
+                st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
+            elif k == n_ahead - 1:
+                # The next layer may refill the ahead ring once its last batch here has run
+                st["ahead_consumed_ev"].record(torch.cuda.current_stream())
 
         # Collect the CPU tail (by now usually complete) and merge
         if tail_jobs:

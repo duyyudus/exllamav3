@@ -606,8 +606,10 @@ class BlockSparseMLP_CPU:
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
         sel_cpu = self._split_translate(selected_experts)
-        return self.cpu_host.submit_prefill(
-            self.cpu_layer_idx, y, sel_cpu, routing_weights), None
+        kind, res = self.cpu_host.submit_prefill_begin(self.cpu_layer_idx, y, sel_cpu, routing_weights)
+        # A copy-ahead layer's streamed compute is enqueued by cpu_split_combine, behind the GPU
+        # expert work, which its weight copies overlap
+        return (res, None) if kind == "out" else (None, ("ahead", res))
 
     def _split_translate(self, selected_experts):
         """Copy-path selection translate: dynamic placement runs the map kernel (hit counts,
@@ -664,7 +666,11 @@ class BlockSparseMLP_CPU:
                 else:
                     self.cpu_host.submit_collect_fused(cpu_pending[1], f2)
                 return final_hidden_states
-            cpu_partial = self.cpu_host.submit_collect(cpu_pending)
+            if isinstance(cpu_pending, tuple) and cpu_pending[0] == "ahead":
+                # Copy-ahead prefill: the streamed compute goes in now, behind the GPU experts
+                cpu_partial = self.cpu_host.submit_prefill_finish(cpu_pending[1])
+            else:
+                cpu_partial = self.cpu_host.submit_collect(cpu_pending)
         if cpu_partial is not None:
             # Whole-layer offload: the worker's output is the routed sum
             final_hidden_states = cpu_partial.view(shape) if final_hidden_states is None \

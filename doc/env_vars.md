@@ -446,6 +446,27 @@ Experts packed per weight-staging batch (one stage job, one DMA, and, below
 the structural size of the job descriptor's expert-id array; raising the ceiling itself costs
 only a small amount of shared-memory overprovisioning, not runtime.
 
+### `EXL3_MOE_STREAM_AHEAD_MB` (default: unset, off)
+
+Copy-ahead ring for split layers' streamed prefill, as `<cuda index>:<MB>[,...]` (for example
+`0:416`). Without it, a layer's streamed experts are computed as their weights land, before the
+GPU-resident experts, so the compute stream waits on every copy. With a ring on a device, the
+streamed experts' weights are copied into it (in native order) as soon as the routing is known,
+the GPU-resident experts are enqueued next, and the streamed compute goes in behind them, so the
+copies overlap that work. Same split, batches and accumulation order as without it, so the
+output is identical. Batches that don't fit the ring take the usual path; the first batches are
+the ones that matter, so the ring does not need to hold a whole layer. Main model only (an MTP
+head or draft model on the same device gets no ring); the VRAM counts in the load budget.
+Measured on GLM-5.3-Flash with a 5-GPU split: `0:416` on the first device, which sets the
+prefill pace, gave +5% to 11% on 60K-token prefills; DeepSeek-V4.1-Flash, whose first device
+also runs every layer's attention, gained about 1.5%. Best on a device with a fast host link;
+on a slow-link device the CPU tail now starts after the resident experts.
+
+### `EXL3_MOE_STREAM_AHEAD` (default: `1`)
+
+`0` disables the copy-ahead ring at runtime (read per layer), restoring the one-shot path while
+keeping the ring allocated. For A/B tests in a running server.
+
 ### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
 
 Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, `bw`/`avx512bw`,
