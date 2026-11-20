@@ -605,6 +605,18 @@ the narrow tile (32 columns per block, k split 16 ways), `1` the wide one (128 c
 4 x 4 warps). Unset picks per stage: wide on Ampere/Ada at every shape, on Blackwell only for
 k >= 4096 or k >= 2048 with 32 or more (token, expert) slots. Testing knob only.
 
+### `EXL3_MOE_COOP_VARIANT` (default: `5`)
+
+Kernel generation of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`). `5` runs
+gate/up and down as one persistent launch whose blocks take work items from an atomic queue (down
+items wait on the gate/up stage's per-chunk counters), stages each warp's weight slices through a
+shared-memory ring with `cp.async`, and uses a dedicated 2.5 bpw unpack; `4` is the same launch
+with variant 3's slice loop; `3` runs the slice-ring kernels as two launches; `0` the original
+kernels. Variants 3 to 5 cover mul1-codebook layers (other codebooks run the original kernels), and
+4 and 5 need gate/up and down at the same bit width (other layers run variant 3). All variants give
+bit-identical results. `exllamav3_ext.exl3_moe_coop_set_variant(v)` changes it at runtime (read at
+every launch). Testing knob only.
+
 ### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: follows `EXL3_MOE_FUSED_DET`)
 
 Bit-reproducible MoE prefill. By default the fused MoE kernel adds each expert's weighted
