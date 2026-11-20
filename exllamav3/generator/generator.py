@@ -40,6 +40,10 @@ class Generator:
     sparse_head = None
     _sparse_flag = False
 
+    # Prompt ingestion first (prefill_priority), off unless the constructor turns it on
+    prefill_priority = False
+    decode_turn_pending = False
+
     def __init__(
         self,
         model: Model,
@@ -49,6 +53,9 @@ class Generator:
         max_chunk_size: int = 2048,
         shared_chunk_size: int | None = None,
         prefill_cooldown: int | None = 4,
+        prefill_priority: bool = False,
+        prefill_slice: float = 0.0,
+        decode_slice: float = 2.0,
         max_q_size: int = 8,
         draft_model: Model | None = None,
         draft_cache: Cache | None = None,
@@ -112,6 +119,26 @@ class Generator:
             pace while prompt ingestion takes one chunk every prefill_cooldown + 1 calls. With several prompts
             waiting, they take turns, one chunk per pass. Default is 4. Set to 0 for a prefill pass on every
             iteration, as when no job is generating
+
+        :param prefill_priority:
+            Replace the shared chunk and cooldown rule above with prompt ingestion first. While any job has
+            prompt left to ingest, generating jobs pause and the prompt takes full chunks on every iteration,
+            so a prefill pipeline over a layer split stays full instead of being drained before every
+            generation step. Prompts are ingested one at a time, the one with the fewest uncached tokens left
+            first (ties in queue order), rather than a chunk each in turn, so a short prompt doesn't wait for a
+            long one and two long ones don't both wait for the sum. A job that finishes its prompt gets its first
+            token before the next prompt continues. Meant for setups where a prompt chunk takes
+            many times longer than a generation step (experts offloaded to the CPU, slow links between
+            devices), where sharing the devices slows both sides down. Default is False
+
+        :param prefill_slice:
+            With prefill_priority: the longest time in seconds that generating jobs are paused for prompt
+            ingestion before they get a turn of decode_slice seconds, plus the time to finish the chunks
+            already in flight when the turn comes. 0 (default) pauses them until no prompt is left
+
+        :param decode_slice:
+            With prefill_priority and prefill_slice: length in seconds of the generating jobs' turn, counted
+            from their first step after the pause. Default is 2.0
 
         :param max_q_size:
             Maximum number of tokens to evaluate per sequence during generation. Leave this at the default
@@ -324,6 +351,16 @@ class Generator:
         self.prefill_cooldown = prefill_cooldown
         self.prefill_cooldown_left = 0
         self.prefill_rotation = 0
+
+        # Prompt ingestion first, see prefill_priority_plan()
+        assert prefill_slice >= 0 and decode_slice > 0, \
+            "prefill_slice must not be negative and decode_slice must be positive"
+        self.prefill_priority = prefill_priority
+        self.prefill_slice = prefill_slice
+        self.decode_slice = decode_slice
+        self.prefill_slice_start = None
+        self.decode_turn_end = None
+        self.decode_turn_pending = False
 
         # Job queues
         self.job_serial = 0
@@ -798,7 +835,10 @@ class Generator:
         prefilling = [job for job in self.active_jobs if not job.is_prefill_done()]
         chunk_size = None
         deferred = []
-        if prefilling and len(prefilling) < len(self.active_jobs) and \
+        pause_generation = False
+        if self.prefill_priority:
+            deferred, pause_generation = self.prefill_priority_plan(prefilling)
+        elif prefilling and len(prefilling) < len(self.active_jobs) and \
                 (self.shared_chunk_size < self.max_chunk_size or self.prefill_cooldown > 0):
             if self.shared_chunk_size < self.max_chunk_size:
                 chunk_size = self.shared_chunk_size
@@ -823,6 +863,17 @@ class Generator:
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
+
+        # Generating jobs paused for prompt ingestion (prefill_priority): no generation step, so the chunks in
+        # flight keep the prefill pipeline busy rather than being waited for
+        if pause_generation:
+            if self.pipeline is not None:
+                self.reap_pipeline_failures(results)
+            if self.visualizer:
+                self.update_visualizer()
+            if self.disk_page_cache is not None and self.disk_cache_write_interval > 0:
+                self.write_behind()
+            return results
 
         # Generation runs in the foreground, on devices and draft state the prefill pipeline has finished with
         if self.pipeline is not None:
@@ -859,6 +910,11 @@ class Generator:
             )
 
         self.iterate_gen(results, draft_tokens)
+        if self.decode_turn_pending:
+            # The generating jobs' turn (prefill_slice) runs from this first step after the pause, which had to
+            # wait for the chunks in flight
+            self.decode_turn_pending = False
+            self.decode_turn_end = time.perf_counter() + self.decode_slice
         if round_start is not None and draft_tokens is not None:
             # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
             drafted = draft_tokens.shape[-1]
@@ -2275,6 +2331,66 @@ class Generator:
             "eos": True,
             "error": error,
         })
+
+
+    @staticmethod
+    def prefill_left(job) -> int:
+        """
+        Prompt tokens a job still has to run through prefill: the rest of its prompt, less the pages ahead that
+        were found in the cache (prefill skips those without a forward pass)
+        """
+        left = 0
+        for seq in job.sequences:
+            end = len(seq.sequence_ids) - 1
+            left += end - seq.kv_position
+            for page in (seq.allocated_pages or [])[seq.kv_position // PAGE_SIZE : end // PAGE_SIZE]:
+                if page.kv_position == PAGE_SIZE:
+                    left -= PAGE_SIZE
+        return max(left, 0)
+
+
+    def prefill_priority_plan(self, prefilling: list) -> tuple[list, bool]:
+        """
+        Schedule one iteration with prompt ingestion first (prefill_priority). Returns the jobs whose prefill
+        pass is deferred, and whether the generating jobs pause this iteration.
+
+        One job with prompt left runs a full chunk per iteration, the one with the fewest uncached tokens left
+        (ties in queue order). Generating jobs pause while any prompt is left, except for one step whenever a
+        job has finished its prompt but not produced its first token yet. With prefill_slice, once they
+        have been paused that long they get a turn: no prompt is ingested until decode_slice seconds after
+        their first step, which waits for the chunks in flight. The clock starts again with the next pause.
+        """
+        generating = len(prefilling) < len(self.active_jobs)
+        if not prefilling or not generating:
+            self.prefill_slice_start = None
+            self.decode_turn_end = None
+            self.decode_turn_pending = False
+            if not prefilling:
+                return [], False
+
+        selected = min(prefilling, key = self.prefill_left)
+        deferred = [job for job in prefilling if job is not selected]
+        if not generating:
+            return deferred, False
+
+        # A prompt just finished: its first token comes before the next prompt goes on, so it doesn't wait
+        # for that whole prompt. The step waits for the chunks already in flight, with no new one issued
+        if any(job.time_first_token is None for job in self.active_jobs if job.is_prefill_done()):
+            return prefilling, False
+
+        # The generating jobs' turn
+        now = time.perf_counter()
+        if self.decode_turn_pending or (self.decode_turn_end is not None and now < self.decode_turn_end):
+            return prefilling, False
+        self.decode_turn_end = None
+
+        if self.prefill_slice_start is None:
+            self.prefill_slice_start = now
+        if self.prefill_slice > 0 and now - self.prefill_slice_start >= self.prefill_slice:
+            self.prefill_slice_start = None
+            self.decode_turn_pending = True
+            return prefilling, False
+        return deferred, True
 
 
     def iterate_start_jobs(self, results: list):
