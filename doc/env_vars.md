@@ -997,7 +997,8 @@ link held the attention device's only stream for the whole transfer (26 ms for 8
 card), and the input crossing made it wait as well. Staged, the slow hops run on the calling
 device's own stream (the send before the lock is taken) and the attention device only does its
 fast hops. Same bytes, so the same result. Read per call. Costs two pinned buffers per device
-(about 126 MB for DeepSeek-V4.1 at 4096-token chunks).
+(80 and 40 MiB for DeepSeek-V4.1 at 4096-token chunks, about 192 MiB of pinned host RAM once
+PyTorch's pinned allocator rounds them up to powers of two).
 
 ### `EXLLAMA_MASTER_ADDR` (default: `127.0.0.1`), `EXLLAMA_MASTER_PORT` (default: auto)
 
